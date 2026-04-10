@@ -819,6 +819,10 @@ def creationTopicTitle(title):
     """
     return requestQwen("你是一名医学内容策划专家，擅长将“单一临床问题”抽象为“高质量证据专区名称”。", user_prompt)
 
+
+
+
+
 def creationZone(title):
     # logger.info(f"开始创建新专区: 【{title}】")
     try:
@@ -1250,8 +1254,21 @@ def file_create_card_async(
         batch_id: Optional[str] = None,
         task_id: Optional[str] = Query(None, description="用于断点续传的旧任务ID"),
         force: bool = Query(False, description="是否强制接管(忽略running状态强制执行)"),  # 🌟 新增参数
-        allowed_topic_ids: Optional[List[int]] = Query(None, description="指定只匹配的专区ID列表，不传则全库匹配")
+        allowed_topic_ids: Optional[List[int]] = Query(None, description="指定只匹配的专区ID列表，不传则全库匹配"),
+        max_workers: Optional[int] = Query(None, description="自定义最大并发线程数") # 🌟 新增前端传参
 ):
+    # ==========================================
+    # 🌟 新增：动态判断并发数逻辑
+    # ==========================================
+    if max_workers is not None:
+        final_workers = max_workers
+    elif allowed_topic_ids is not None:
+        final_workers = 3
+    elif batch_id is not None:
+        final_workers = 1
+    else:
+        final_workers = 1  # 兜底默认值
+
     """前端触发接口：兼容单文件与全库挖掘"""
     # ==========================================
     # 分支 1：如果是断点续传（传了 task_id）
@@ -1261,7 +1278,7 @@ def file_create_card_async(
         if not existing_state:
             return JSONResponse(content={"code": 404, "msg": "未找到指定的历史任务文件，无法续传"})
 
-        # 🌟 修改这里：如果状态是 running，但用户传了 force=true，就强制接管
+        # 修改这里：如果状态是 running，但用户传了 force=true，就强制接管
         if existing_state.get("status") == "running" and not force:
             return JSONResponse(
                 content={"code": 400, "msg": "该挖掘任务正在后台运行中。如果确定是死任务，请传递 &force=true 强制续传"})
@@ -1271,7 +1288,7 @@ def file_create_card_async(
             "msg": "后台断点续传任务已恢复..."
         })
 
-        background_tasks.add_task(continuous_mining_worker, task_id, None, allowed_topic_ids)
+        background_tasks.add_task(continuous_mining_worker, task_id, None, allowed_topic_ids, final_workers)
         return JSONResponse(content={
             "code": 200,
             "msg": "后台断点续传任务已成功启动",
@@ -1291,7 +1308,7 @@ def file_create_card_async(
     init_task_state(task_id)
 
     # 丢入后台执行
-    background_tasks.add_task(continuous_mining_worker, task_id, batch_id, allowed_topic_ids)
+    background_tasks.add_task(continuous_mining_worker, task_id, batch_id, allowed_topic_ids, final_workers)
 
     return JSONResponse(content={
         "code": 200,
@@ -1580,9 +1597,9 @@ def _mine_data_batch(task_id: str, target_batch_id: str, embeddings: np.ndarray,
 
 # 模块 5：总调度台 (Worker Main)
 # ==========================================
-def continuous_mining_worker(task_id: str, target_batch_id: Optional[str], allowed_topic_ids: Optional[List[int]] = None):
+def continuous_mining_worker(task_id: str, target_batch_id: Optional[str], allowed_topic_ids: Optional[List[int]] = None, max_workers: int = 1):
     # 【多线程配置】
-    MAX_WORKERS = 8
+    MAX_WORKERS = max_workers
 
     try:
         state = read_task_state(task_id)
@@ -1894,4 +1911,5 @@ def stop_task(
 
 if __name__ == '__main__':
     # 强制 workers=1 保护显存
+    # uvicorn.run("async_api_server:app", host="0.0.0.0", port=5811, workers=1)
     uvicorn.run("async_api_server:app", host="0.0.0.0", port=6006, workers=1)

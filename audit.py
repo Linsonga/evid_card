@@ -5,7 +5,6 @@ import asyncio
 from datetime import datetime
 import pymysql
 from pymilvus import MilvusClient
-from config import MILVUS_URI, MILVUS_TOKEN, MILVUS_COLLECTION_RAG
 from utils import call_qwen, extract_json_from_text, vector_4b, requestQwenMultiTurn
 from logger import logger
 from config import (
@@ -701,11 +700,11 @@ class AgenticPipeline:
 
         passed_data = []
         failed_data = []
-        MAX_RETRIES = 1  # 每条数据最多抢救2次
+        MAX_RETRIES = 2  # 每条数据最多抢救2次
 
         # 1. 精准提取当前专区的避坑规则
         local_rules = self.retrieve_local_memories(zone_name)
-        pass_score_threshold = 85 if (not batch_id or batch_id == "GLOBAL_ALL") else 95
+        pass_score_threshold = 80 if (not batch_id or batch_id == "GLOBAL_ALL") else 95
 
         for item in data_list:
             current_title = item["title"]
