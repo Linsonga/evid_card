@@ -5,6 +5,7 @@ from config import DB_CONFIG
 from utils import vector_4b
 from logger import logger
 from database import get_db_connection
+from utils import get_cached_vector
 
 class QwenEmbeddingMatcher:
     def __init__(self):
@@ -120,13 +121,24 @@ class QwenEmbeddingMatcher:
             conn.close()
 
         titles = [row["title"] for row in results]
-        embeddings_list = [vector_4b(t) for t in titles if vector_4b(t)]
 
+        valid_titles = []
+        embeddings_list = []
+
+        # 2. 🌟 替换掉原来的双重推导式，改用带缓存的函数
+        for t in titles:
+            vec = get_cached_vector(t)
+            if vec:
+                valid_titles.append(t)
+                embeddings_list.append(vec)
+
+        # 3. 更新内存属性
         self.topic_cards_cache[topic_id] = {
-            "titles": titles,
+            "titles": valid_titles,
             "embeddings": np.array(embeddings_list) if embeddings_list else np.array([])
         }
-        logger.info(f"Topic_ID={topic_id} 局部卡片加载完成 (共 {len(titles)} 条)。")
+
+        logger.info(f"Topic_ID={topic_id} 局部卡片加载完成 (共 {len(valid_titles)} 条)。")
 
     def add_card_to_cache(self, topic_id, card_title, card_vec):
         if topic_id not in self.topic_cards_cache:

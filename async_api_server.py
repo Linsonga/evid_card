@@ -9,9 +9,6 @@ import subprocess
 from datetime import datetime
 from typing import List
 from urllib.parse import quote
-
-# from motor.motor_asyncio import AsyncIOMotorClient
-
 import pymysql
 import requests
 import pdfplumber
@@ -23,12 +20,11 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances
 from sklearn.preprocessing import normalize
 import uvicorn
-
 from multi_pdf_to_json_queue import PDFParsing, LAYOUT_PATH
 from config import (
-    DB_CONFIG, CARD_API_URL, EVID_DESC_URL,
-    MILVUS_MAIN_URI, MILVUS_MAIN_TOKEN, MILVUS_COLLECTION_MAIN, MILVUS_REFINEDDATA,
-    MONGO_URI, MONGO_DATABASE, MONGO_COLLECTION
+    DB_CONFIG, CARD_API_URL, EVID_DESC_URL,MILVUS_MAIN_URI, MILVUS_MAIN_TOKEN, MILVUS_COLLECTION_MAIN,
+    MILVUS_REFINEDDATA,MONGO_URI, MONGO_DATABASE, MONGO_COLLECTION, LOGIN_URL,GENERATE_PIC_URL,
+    UPLOAD_ZONE_URL,USERNAME,PASSWORD
 )
 from utils import (
     requestQwen, requestQwenMultiTurn, request_qwen_async,
@@ -51,8 +47,6 @@ import numpy as np
 from utils import vector_4b  # 确保你的文件顶部有这个导入
 from database import get_db_connection
 
-
-
 app = FastAPI(title="异步 PDF 解析 API", description="支持超大 PDF 的非阻塞解析服务")
 
 # ================= 配置区 =================
@@ -62,6 +56,9 @@ RESULT_DIR = os.path.join(BASE_DIR, "results")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
+
+# ======= 配置区 =======
+TOKEN_FILE_PATH = "evimed_token.json"
 
 # 全局变量
 pdf_parser_engine = None
@@ -822,34 +819,198 @@ def creationTopicTitle(title):
 
 
 
+# 假设你在外部定义了 EVID_DESC_URL
+# EVID_DESC_URL = "..."
 
-def creationZone(title):
-    # logger.info(f"开始创建新专区: 【{title}】")
+# ==========================================
+# 1. 登录与 Token 管理机制 (缓存 1 天)
+# ==========================================
+def get_valid_token():
+    """获取 Token，优先从本地缓存读取，过期（1天）或不存在则重新登录"""
+    current_time = time.time()
+
+    # 检查本地是否有缓存且未过期 (86400秒 = 1天)
+    if os.path.exists(TOKEN_FILE_PATH):
+        try:
+            with open(TOKEN_FILE_PATH, "r", encoding="utf-8") as f:
+                token_data = json.load(f)
+                save_time = token_data.get("timestamp", 0)
+                if current_time - save_time < 86400:
+                    # print("✅ 使用本地缓存的有效 Token")
+                    return token_data.get("token")
+        except Exception as e:
+            print(f"⚠️ 读取本地Token文件异常，将重新登录: {e}")
+
+    # 如果没有有效 Token，执行登录请求
+    print("🔄 Token 不存在或已过期，正在请求登录接口...")
+    login_data = {
+        "username": USERNAME,
+        "password": PASSWORD  # ⚠️ 请替换为实际的密码
+    }
+
     try:
-        response = requests.get(EVID_DESC_URL, params={"desc": title}, verify=False)
+        response = requests.post(LOGIN_URL, json=login_data, timeout=10)
+        if response.status_code == 200:
+            response_data = response.json()
+            token = response_data.get("token")
+
+            if token:
+                print(f"✅ 登录成功！获取到新 Token: {token}")
+                # 保存到本地文件
+                with open(TOKEN_FILE_PATH, "w", encoding="utf-8") as f:
+                    json.dump({"token": token, "timestamp": current_time}, f)
+                return token
+            else:
+                print("❌ 登录失败，接口未返回 token 字段:", response_data)
+        else:
+            print(f"❌ 登录请求失败，状态码：{response.status_code}")
+    except Exception as e:
+        print(f"❌ 发生网络请求错误：{e}")
+
+    return None
+
+
+# ==========================================
+# 2. 生成图片并调用 API 创建专区
+# ==========================================
+def generate_and_transfer_image(title, describe):
+    """请求生成图片，下载流，并带上 Token 提交专区创建表单"""
+    # 1. 获取有效 Token
+    token = get_valid_token()
+    if not token:
+        print("❌ 无法获取有效 Token，终止创建专区。")
+        return None
+
+    # 2. 生成图片链接
+    print(f"正在根据标题 '{title}' 请求生成图片...")
+    try:
+        gen_response = requests.get(GENERATE_PIC_URL, params={'title': title}, timeout=15)
+        if gen_response.status_code != 200:
+            print(f"❌ 图片生成失败，状态码: {gen_response.status_code}")
+            return None
+
+        image_url = gen_response.text.strip()
+        print(f"✅ 成功获取图片链接: {image_url}")
+    except Exception as e:
+        print(f"❌ 请求生成图片异常: {e}")
+        return None
+
+    # 3. 获取图片文件流
+    print("正在以【文件流】模式下载该图片...")
+    try:
+        img_response = requests.get(image_url, stream=True, timeout=15)
+        if img_response.status_code != 200:
+            print(f"❌ 图片下载失败，状态码: {img_response.status_code}")
+            return None
+    except Exception as e:
+        print(f"❌ 下载图片网络异常: {e}")
+        return None
+
+    # 4. 组装数据并上传创建专区
+    headers = {
+        "token": token
+    }
+
+    # 填入大模型生成的专区描述 describe
+    data = {
+        "title": title,
+        "describe": describe,
+        "isPub": "0",
+        "cardCorrelation": "0",
+        "publishAuth": "0",
+        "unit": "灵犀医疗",
+        "type": "0",
+        "users": "16710810141"
+    }
+
+    files = {
+        "image": ("cover_image.jpg", img_response.content, "image/jpeg")
+    }
+
+    print("正在提交图文数据到服务器...")
+    try:
+        upload_response = requests.post(
+            UPLOAD_ZONE_URL,
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=20
+        )
+
+        if upload_response.status_code == 200:
+            res_data = upload_response.json()
+            latest_id = res_data.get("data", {}).get("id")
+
+            if latest_id:
+                print(f"✅ 上传成功！最新专区 ID 为: {latest_id}")
+                return latest_id
+            else:
+                print("⚠️ 上传成功，但未在返回数据中找到 ID 字段:", res_data)
+                return None
+        else:
+            print(f"❌ 上传失败，状态码: {upload_response.status_code}")
+            print("错误详情:", upload_response.text)
+            return None
+
+    except Exception as e:
+        print(f"❌ 提交图文数据异常: {e}")
+        return None
+
+
+# ==========================================
+# 3. 改造原有的 creationZone 函数
+# ==========================================
+def creationZone(title):
+    """
+    主入口：获取专区大模型描述 -> 走 API 创建专区
+    (替代了原先直接写入 MySQL 的逻辑)
+    """
+    # 1. 动态获取大模型的“专区描述”
+    try:
+        response = requests.get(EVID_DESC_URL, params={"desc": title}, verify=False, timeout=15)
         data_text = response.json().get("data", "")
         describe = data_text.split("\n\n")[0] if data_text else "智能生成的专区描述"
     except Exception as e:
+        print(f"⚠️ 获取大模型描述失败，将使用默认描述。原因: {e}")
         describe = "智能生成的专区描述"
 
-    # 🌟 修改点：从连接池获取连接
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    new_topic_id = None
-    try:
-        sql = """INSERT INTO evidence_topic (title, `describe`, classification, is_pub, publish_auth, card_correlation, `type`) VALUES (%s, %s, 0, 0, 0, 0, 0)"""
-        cursor.execute(sql, (title, describe))
-        conn.commit()
-        new_topic_id = cursor.lastrowid
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"新专区插入数据库失败: {e}")
-    finally:
-        # 🌟 修改点：确保归还连接
-        cursor.close()
-        conn.close()
+    # 2. 调用 API 创建流程获取 new_topic_id
+    new_topic_id = generate_and_transfer_image(title, describe)
+
+    if new_topic_id:
+        print(f"🎉 专区【{title}】创建全流程结束，获得最终 ID: {new_topic_id}")
+    else:
+        print(f"💔 专区【{title}】创建失败。")
 
     return new_topic_id
+
+# def creationZone(title):
+#     # logger.info(f"开始创建新专区: 【{title}】")
+#     try:
+#         response = requests.get(EVID_DESC_URL, params={"desc": title}, verify=False)
+#         data_text = response.json().get("data", "")
+#         describe = data_text.split("\n\n")[0] if data_text else "智能生成的专区描述"
+#     except Exception as e:
+#         describe = "智能生成的专区描述"
+#
+#     # 🌟 修改点：从连接池获取连接
+#     conn = get_db_connection()
+#     cursor = conn.cursor()
+#     new_topic_id = None
+#     try:
+#         sql = """INSERT INTO evidence_topic (title, `describe`, classification, is_pub, publish_auth, card_correlation, `type`) VALUES (%s, %s, 0, 0, 0, 0, 0)"""
+#         cursor.execute(sql, (title, describe))
+#         conn.commit()
+#         new_topic_id = cursor.lastrowid
+#     except Exception as e:
+#         conn.rollback()
+#         logger.error(f"新专区插入数据库失败: {e}")
+#     finally:
+#         # 🌟 修改点：确保归还连接
+#         cursor.close()
+#         conn.close()
+#
+#     return new_topic_id
 
 
 # ==== Matching 匹配专区  ====

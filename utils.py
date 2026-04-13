@@ -9,6 +9,10 @@ from config import (
     EMBEDDING_URL,
 )
 from logger import logger
+import json
+import os
+from filelock import FileLock
+
 
 # 屏蔽 requests verify=False 引起的警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -124,3 +128,65 @@ def vector_4b(text):
     except Exception as e:
         logger.error(f"获取向量失败 (API异常): {e}")
         return []
+
+
+
+VECTOR_CACHE_FILE = "local_vector_cache.jsonl"
+VECTOR_CACHE_LOCK = f"{VECTOR_CACHE_FILE}.lock"
+
+# 全局内存缓存，仅在启动时或第一次调用时加载一次
+_global_vector_cache = None
+
+
+def load_vector_cache():
+    """将 JSONL 文件一次性加载到内存字典中"""
+    global _global_vector_cache
+    if _global_vector_cache is None:
+        _global_vector_cache = {}
+        if os.path.exists(VECTOR_CACHE_FILE):
+            with open(VECTOR_CACHE_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        # data 格式约定为: {"title": [0.1, 0.2, ...]}
+                        _global_vector_cache.update(data)
+                    except Exception as e:
+                        print(f"解析缓存行失败，跳过: {e}")
+        print(f"✅ 向量本地缓存加载成功，共载入 {len(_global_vector_cache)} 条记录。")
+    return _global_vector_cache
+
+
+def get_cached_vector(title):
+    """
+    智能获取向量：
+    1. 查内存缓存 (极速)
+    2. 内存没有 -> 请求接口 -> 追加写入文件
+    """
+    if not title:
+        return []
+
+    cache = load_vector_cache()
+
+    # 1. 内存极速查询
+    if title in cache:
+        return cache[title]
+
+    # 2. 内存没有，触发真实的网络请求
+    print(f"🚀 触发大模型向量接口: {title[:20]}...")
+    vec = vector_4b(title)
+
+    # 3. 存入内存，并以追加模式 (a) 写入文件
+    if vec:
+        cache[title] = vec
+
+        # 加锁防止多进程/多线程并发写入时文件损坏
+        with FileLock(VECTOR_CACHE_LOCK, timeout=10):
+            with open(VECTOR_CACHE_FILE, "a", encoding="utf-8") as f:
+                # 每条记录占一行，极简且追加速度极快
+                record = {title: vec}
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return vec
