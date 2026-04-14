@@ -544,8 +544,9 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, pdf_path: st
             chunked_data = [{"text": x.strip()} for x in parts if x.strip()]
             print(chunked_data)
             print(type(chunked_data))
-            # chunked_data = chunk_text_data([{"type": "text", "text": xmind_str}], split_to_length=400)
-            # print(chunked_data)
+            chunked_data = chunk_text_data([{"type": "text", "text": xmind_str}], split_to_length=400)
+            print(chunked_data)
+            exit()
             db_result = process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='xmind')
 
         else:
@@ -653,8 +654,8 @@ async def create_upload_batch( background_tasks: BackgroundTasks, files: List[Up
         task_list.append({"task_id": task_id, "filename": file.filename})
 
     # 启动自动流程：等待所有任务完成后自动调用 file_create_card
-    task_ids = [task["task_id"] for task in task_list]
-    background_tasks.add_task(auto_process_workflow, batch_id, task_ids)
+    # task_ids = [task["task_id"] for task in task_list]
+    # background_tasks.add_task(auto_process_workflow, batch_id, task_ids)
 
     return JSONResponse(content={
         "code": 200,
@@ -2102,7 +2103,135 @@ def stop_task(
 #             })
 
 
+# ================= 在 async_api_server.py 顶部增加引用 =================
+from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.session import ClientSession
+from utils import get_distributed_filenames, record_distribution
+
+# 确保你在 config.py 中有这两个变量，或者根据你实际的变量名修改
+# from config import WECHAT_APP_ID, WECHAT_APP_SECRET
+
+CARD_MD_DIR = os.path.join(os.getcwd(), "card_md")
+
+
+# ================= 添加每天定时触发的 API 接口 =================
+@app.post("/api/v1/daily_wechat_push")
+async def daily_wechat_push(background_tasks: BackgroundTasks):
+    """
+    每天定时分发接口：扫描 card_md -> 过滤已发 -> 取前 8 篇 -> 后台调用 MCP 推送
+    """
+    if not os.path.exists(CARD_MD_DIR):
+        return JSONResponse(content={"code": 404, "msg": "card_md 目录不存在"})
+
+    # 1. 获取曾经成功发送过的内容
+    sent_list = get_distributed_filenames('wechat')
+
+    # 2. 扫描目录获取所有 markdown，并过滤掉已经发送的
+    all_files = [f for f in os.listdir(CARD_MD_DIR) if f.endswith('.md')]
+    pending_files = [f for f in all_files if f not in sent_list]
+
+    # 3. 严格截取前 8 篇（微信每日订阅号限制或测试限制）
+    target_files = pending_files[:8]
+
+    if not target_files:
+        return JSONResponse(content={"code": 200, "msg": "今日无新文章可推送，所有卡片均已分发。"})
+
+    # 4. 把耗时的 MCP 启动和发布过程丢到后台执行
+    background_tasks.add_task(process_wechat_distribution_via_mcp, target_files)
+
+    return JSONResponse(content={
+        "code": 200,
+        "msg": f"已启动后台分发任务，准备推送 {len(target_files)} 篇文章",
+        "files": target_files
+    })
+
+
+# ================= 基于你提供的示例改写的后台执行函数 =================
+async def process_wechat_distribution_via_mcp(filenames: list):
+    """
+    后台任务：建立一次 MCP 会话，批量发布传入的文件列表
+    """
+    server_script_path = os.path.abspath("./wechat-publisher-mcp/src/server.js")
+
+    server_params = StdioServerParameters(
+        command="node",
+        args=[server_script_path],
+        env=None
+    )
+
+    print(f"\n[后台分发] 正在启动并连接到 MCP Server，共有 {len(filenames)} 篇文章待发...")
+
+    try:
+        # 建立全局唯一的 stdio 连接，避免每发一篇文章重启一次 Node 进程
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                print("✅ [后台分发] MCP 会话初始化成功！开始执行发布任务...")
+
+                for idx, fname in enumerate(filenames):
+                    file_path = os.path.join(CARD_MD_DIR, fname)
+                    title = fname.replace('.md', '')
+
+                    try:
+                        # 读取本地 MD 文件内容
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+
+                        # 构建 MCP 工具调用参数
+                        arguments = {
+                            "title": title,
+                            "content": content,
+                            "author": "灵犀量子 AI",
+                            "appId": WECHAT_APP_ID,  # 请替换为你在 config 里的真实变量
+                            "appSecret": WECHAT_APP_SECRET,
+                            "previewMode": False,
+                            "coverImagePath": ""  # 没有封面留空，MCP内部会自动生成
+                        }
+
+                        print(f"\n🚀 正在发布第 {idx + 1}/{len(filenames)} 篇: {title}")
+
+                        # 调用 MCP 工具
+                        result = await session.call_tool(
+                            "wechat_publish_article",
+                            arguments=arguments
+                        )
+
+                        # 解析 MCP Server 返回的文本信息
+                        res_text = ""
+                        for content_item in result.content:
+                            if content_item.type == "text":
+                                res_text += content_item.text
+
+                        # 判断是否发布成功 (如果你的 server.js 失败会返回 "❌ 发布失败")
+                        if "❌" not in res_text and result.isError is not True:
+                            # 记录到 jsonl，状态为 success
+                            record_distribution('wechat', fname, 'success', res_text)
+                            print(f"✅ 【{fname}】 发布成功: {res_text.strip()}")
+                        else:
+                            # 记录到 jsonl，状态为 failed
+                            record_distribution('wechat', fname, 'failed', res_text)
+                            print(f"❌ 【{fname}】 业务级失败: {res_text.strip()}")
+
+                    except Exception as e:
+                        # 异常捕捉：防止单篇文章报错中断了后面7篇的发送
+                        record_distribution('wechat', fname, 'failed', f"Python脚本异常: {str(e)}")
+                        print(f"❌ 【{fname}】 发送发生内部异常: {e}")
+
+                print("\n🎉 [后台分发] 批量发布任务执行结束，MCP 连接已安全关闭。")
+
+    except Exception as e:
+        print(f"❌ [后台分发] MCP Server 连接或会话建立失败: {e}")
+
+
+
 if __name__ == '__main__':
     # 强制 workers=1 保护显存
     # uvicorn.run("async_api_server:app", host="0.0.0.0", port=5811, workers=1)
     uvicorn.run("async_api_server:app", host="0.0.0.0", port=6006, workers=1)
+
+
+
+
+
+
+

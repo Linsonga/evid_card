@@ -1,22 +1,22 @@
+import os
 import re
 import json
 import urllib3
 import requests
+import threading
+
+from logger import logger
+from filelock import FileLock
+from datetime import datetime
 from openai import OpenAI, AsyncOpenAI
 from config import (
     QWEN_API_KEY, QWEN_BASE_URL,
     QWEN_MODEL_DEFAULT, QWEN_MODEL_SEARCH, QWEN_MODEL_MULTI_TURN,
     EMBEDDING_URL,
 )
-from logger import logger
-import json
-import os
-from filelock import FileLock
-import threading # 顶部引入
 
 # 屏蔽 requests verify=False 引起的警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 
 # ================= 大模型调用 =================
 def requestQwen(system_prompt, user_prompt):
@@ -187,3 +187,41 @@ def get_cached_vector(title):
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     return vec
+
+
+
+
+DIST_LOG_FILE = os.path.join(os.getcwd(), 'distribution_records.jsonl')
+dist_lock = threading.Lock()
+
+def get_distributed_filenames(platform='wechat'):
+    """获取已成功分发的文件名列表"""
+    if not os.path.exists(DIST_LOG_FILE):
+        return set()
+
+    distributed = set()
+    with dist_lock:
+        with open(DIST_LOG_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    # 只有状态为 success 的才算已发送，失败的第二天还可以重试
+                    if data.get('type') == platform and data.get('status') == 'success':
+                        distributed.add(data.get('filename'))
+                except:
+                    continue
+    return distributed
+
+
+def record_distribution(platform, filename, status, note=""):
+    """记录分发结果追加到 jsonl 文件"""
+    log_entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "type": platform,
+        "filename": filename,
+        "status": status,
+        "note": note
+    }
+    with dist_lock:
+        with open(DIST_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
