@@ -1763,6 +1763,38 @@ def continuous_mining_worker(task_id: str, target_batch_id: Optional[str], allow
     MAX_WORKERS = max_workers
 
     try:
+
+        # ========================================================
+        # 🌟 新增：前置校验 allowed_topic_ids (防止无效扫描)
+        # ========================================================
+        if allowed_topic_ids is not None:
+            # 1. 如果前端传了一个空列表 []
+            if len(allowed_topic_ids) == 0:
+                update_task_state(task_id, {
+                    "status": "failed",
+                    "msg": "❌ 启动失败：传入的专区限制列表为空，任务已终止。"
+                })
+                print(f"🛑 提前终止：任务 [{task_id}] 传入的 allowed_topic_ids 为空。")
+                return
+
+            # 2. 校验传入的 ID 是否在我们的全局内存库中
+            valid_ids = [tid for tid in allowed_topic_ids if tid in global_matcher.topic_ids]
+
+            # 如果没有一个是有效的，直接掐断线程！
+            if not valid_ids:
+                update_task_state(task_id, {
+                    "status": "failed",  # 或者标为 finished
+                    "msg": f"❌ 启动失败：您指定的专区 ID {allowed_topic_ids} 在数据库中不存在或已失效！"
+                })
+                print(f"🛑 提前终止：任务 [{task_id}] 指定的专区 IDs {allowed_topic_ids} 全部无效，停止扫描以释放资源。")
+                return
+
+            # 3. 纠正数据：过滤掉其中错的，只保留对的，防止后续报错
+            allowed_topic_ids = valid_ids
+            print(f"✅ 专区 ID 校验通过，最终生效的匹配专区为: {allowed_topic_ids}")
+
+        # ========================================================
+
         state = read_task_state(task_id)
         total_processed = state.get("cursor", {}).get("total_processed", 0)
 

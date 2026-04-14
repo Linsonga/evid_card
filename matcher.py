@@ -6,6 +6,7 @@ from utils import vector_4b
 from logger import logger
 from database import get_db_connection
 from utils import get_cached_vector
+import threading # 顶部引入
 
 class QwenEmbeddingMatcher:
     def __init__(self):
@@ -15,6 +16,7 @@ class QwenEmbeddingMatcher:
         self.topic_descs = []
         self.desc_embeddings = np.array([])
         self.topic_cards_cache = {}
+        self.topic_lock = threading.Lock()  # 🌟 新增：专区缓存锁
         self.load_topic_data()
 
     def load_topic_data(self):
@@ -89,8 +91,11 @@ class QwenEmbeddingMatcher:
 
     def filterExistingTitleInTopic(self, new_title, new_vec, topic_id, threshold=0.85):
         if not new_vec: return False
+        # 🌟 修改：使用双重检查锁，防止多线程同时去数据库拉取同一个专区
         if topic_id not in self.topic_cards_cache:
-            self._load_cards_for_topic(topic_id)
+            with self.topic_lock:
+                if topic_id not in self.topic_cards_cache:
+                    self._load_cards_for_topic(topic_id)
 
         cache = self.topic_cards_cache[topic_id]
         if len(cache["embeddings"]) == 0:
