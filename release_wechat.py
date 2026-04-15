@@ -1,25 +1,14 @@
 # -*- coding: utf-8 -*-
 # @Time    : 14.04.2026
-# @File    : publish_test.py.py
+# @File    : release_wechat.py
 # @Software: PyCharm
 
 """
-# 知乎发布文章
+# 微信发布文章
+# 微信发布文章（自动读取、过滤已发布、大模型智能匹配应季文章）
 publish_test.py - Description of the file/module
 """
 
-# -*- coding: utf-8 -*-
-# @Time    : 14.04.2026
-# @File    : release_zhihu.py
-# @Software: PyCharm
-
-"""
-# 知乎发布文章（自动读取、过滤已发布、大模型智能匹配应季文章）
-"""
-
-# -*- coding: utf-8 -*-
-# @Time    : 14.04.2026
-# @File    : release_zhihu.py
 
 import os
 import json
@@ -83,6 +72,7 @@ def main():
     # --- 配置项 ---
     md_dir = "card_md"
     test_mode = True  # 设置为 True 则只成功发布一条后停止
+    # --------------
 
     if not os.path.exists(md_dir):
         print(f"目录 {md_dir} 不存在。")
@@ -111,17 +101,17 @@ def main():
 
     print(f"共发现 {len(all_md_files)} 个文件，待发布 {len(unpublished_files)} 个。")
 
-    # # 3. 联网搜索实时热点并筛选
-    seasonal_files = get_seasonal_articles_realtime(unpublished_files)
-
-    if not seasonal_files:
-        print("未匹配到实时热点文章。")
-        if test_mode:
-            print("测试模式：强制选取第一个待发布文件进行测试。")
-            seasonal_files = [unpublished_files[0]]
-        else:
-            return
-    # seasonal_files = [unpublished_files[0]]
+    # # # 3. 联网搜索实时热点并筛选
+    # seasonal_files = get_seasonal_articles_realtime(unpublished_files)
+    #
+    # if not seasonal_files:
+    #     print("未匹配到实时热点文章。")
+    #     if test_mode:
+    #         print("测试模式：强制选取第一个待发布文件进行测试。")
+    #         seasonal_files = [unpublished_files[0]]
+    #     else:
+    #         return
+    seasonal_files = [unpublished_files[0]]
     # 4. 批量/单条发布
     success_count = 0
     for rel_path in seasonal_files:
@@ -149,7 +139,8 @@ def main():
 
             # 使用文件名（不含路径和后缀）作为标题
             file_name = os.path.basename(rel_path)
-            title = os.path.splitext(file_name)[0].replace('_', '')[:100]
+            # title = os.path.splitext(file_name)[0][:100]
+            title = os.path.splitext(file_name)[0].strip('_')[:100]
 
             print(f"\n正在发布路径为 [{rel_path}] 的文章...")
 
@@ -164,10 +155,9 @@ def main():
             success_count += 1
 
             break
-
-            if test_mode and success_count >= 1:
-                print("✅ 今日发文任务已完成（1篇），程序正常退出。")
-                break
+            # if test_mode and success_count >= 1:
+            #     print("\n💡 测试模式：已成功发布一条，程序退出。")
+            #     break
 
         except Exception as e:
             print(f"处理文件 {rel_path} 失败: {e}")
