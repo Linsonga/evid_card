@@ -191,7 +191,7 @@ def get_cached_vector(title):
 
 
 
-DIST_LOG_FILE = os.path.join(os.getcwd(), 'distribution_records.jsonl')
+DIST_LOG_FILE = os.path.join(os.getcwd(), 'release_md.jsonl')
 dist_lock = threading.Lock()
 
 def get_distributed_filenames(platform='wechat'):
