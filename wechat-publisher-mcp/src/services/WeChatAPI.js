@@ -142,6 +142,44 @@ class WeChatAPI {
     }
   }
 
+  /**
+   * 仅创建草稿，不发布（用于排版预览）
+   * @param {Array} articles 文章数组，每项包含 title/content/author/thumbMediaId
+   * @returns {Promise<Object>} { success, mediaId }
+   */
+  async saveDraft(articles) {
+    const accessToken = await this.getAccessToken();
+    const draftArticles = articles.map(art => {
+      const articleData = {
+        title: art.title,
+        author: art.author || '',
+        digest: this.extractDigest(art.content),
+        content: art.content,
+        content_source_url: '',
+        need_open_comment: 0,
+        only_fans_can_comment: 0
+      };
+      if (art.thumbMediaId) {
+        articleData.thumb_media_id = art.thumbMediaId;
+      }
+      return articleData;
+    });
+
+    const draftResponse = await axios.post(
+      `https://api.weixin.qq.com/cgi-bin/draft/add?access_token=${accessToken}`,
+      { articles: draftArticles },
+      { timeout: 30000 }
+    );
+
+    if (draftResponse.data.errcode && draftResponse.data.errcode !== 0) {
+      throw new Error(`创建草稿失败: ${draftResponse.data.errmsg}`);
+    }
+
+    const mediaId = draftResponse.data.media_id;
+    logger.info('草稿保存成功', { mediaId, count: articles.length });
+    return { success: true, mediaId };
+  }
+
   // 新增：支持多图文发布
   async publishMultiArticles(articles) {
     const accessToken = await this.getAccessToken();

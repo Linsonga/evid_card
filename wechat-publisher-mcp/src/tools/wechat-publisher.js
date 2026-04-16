@@ -9,6 +9,72 @@ import logger from '../utils/logger.js';
  */
 class WeChatPublisher {
 
+  /**
+   * 仅保存为草稿，不发布（用于在微信公众号后台预览排版效果）
+   * @param {Object} params 与 publishMulti 参数相同
+   * @returns {Object} MCP格式的响应结果
+   */
+  static async saveToDraft(params) {
+    const { articles, appId, appSecret, coverImagePath } = params;
+    const wechatAPI = new WeChatAPI(appId, appSecret);
+    const processedArticles = [];
+
+    for (let i = 0; i < articles.length; i++) {
+      const art = articles[i];
+      const htmlContent = MarkdownConverter.convertToWeChatHTML(art.content);
+      let thumbMediaId = null;
+
+      let coverPath = art.coverImagePath || (i === 0 ? coverImagePath : null);
+      let coverUrl = art.coverImageUrl || (i === 0 ? params.coverImageUrl : null);
+
+      if (!coverPath && coverUrl) {
+        logger.info(`第 ${i + 1} 篇：检测到封面图URL，开始下载...`);
+        coverPath = await WeChatPublisher.downloadImage(coverUrl);
+      }
+
+      // 没有封面图时自动生成（草稿模式每篇也需要 thumb_media_id）
+      if (!coverPath) {
+        logger.info(`第 ${i + 1} 篇：未提供封面图，自动生成封面图...`);
+        try {
+          coverPath = await WeChatPublisher.generateCoverImage(art.title, art.content);
+        } catch (genError) {
+          logger.warn(`第 ${i + 1} 篇：自动生成封面图失败`, { error: genError.message });
+        }
+      }
+
+      if (coverPath) {
+        try {
+          thumbMediaId = await wechatAPI.uploadCoverImage(coverPath);
+          logger.info(`第 ${i + 1} 篇：封面图上传成功`, { mediaId: thumbMediaId });
+          const isAutoGenOrUrl = !art.coverImagePath && !(i === 0 && coverImagePath);
+          if (isAutoGenOrUrl) {
+            const fs = await import('fs/promises');
+            await fs.default.unlink(coverPath).catch(() => {});
+          }
+        } catch (uploadErr) {
+          throw new Error(`第 ${i + 1} 篇文章封面图上传失败: ${uploadErr.message}`);
+        }
+      } else {
+        throw new Error(`第 ${i + 1} 篇文章缺少封面图，微信草稿接口要求每篇文章都必须提供封面图`);
+      }
+
+      processedArticles.push({
+        title: art.title,
+        content: htmlContent,
+        author: art.author || '',
+        thumbMediaId
+      });
+    }
+
+    const result = await wechatAPI.saveDraft(processedArticles);
+    return {
+      content: [{
+        type: "text",
+        text: `✅ 草稿保存成功！共 ${articles.length} 篇文章已存入草稿箱。\n📝 媒体ID(media_id): ${result.mediaId}\n\n💡 请登录微信公众号后台 → 草稿箱 查看排版效果。`
+      }]
+    };
+  }
+
   static async publishMulti(params) {
     const { articles, appId, appSecret, coverImagePath } = params;
     const wechatAPI = new WeChatAPI(appId, appSecret);
@@ -19,20 +85,44 @@ class WeChatPublisher {
       const htmlContent = MarkdownConverter.convertToWeChatHTML(art.content);
       let thumbMediaId = null;
 
-      // 只有第一篇文章需要封面图
-      if (i === 0) {
-        let coverPath = art.coverImagePath || coverImagePath;
-        if (!coverPath) {
-          logger.info('自动生成封面图');
+      // 微信多图文草稿接口要求每篇文章都必须有 thumb_media_id，不能为 null
+      // 所以每篇文章都需要处理封面图
+      let coverPath = art.coverImagePath || (i === 0 ? coverImagePath : null);
+      let coverUrl = art.coverImageUrl || (i === 0 ? params.coverImageUrl : null);
+
+      // 优先使用本地路径，否则尝试下载 URL
+      if (!coverPath && coverUrl) {
+        logger.info(`第 ${i + 1} 篇：检测到封面图URL，开始下载...`);
+        coverPath = await WeChatPublisher.downloadImage(coverUrl);
+      }
+
+      // 如果仍然没有封面图，则自动生成一张
+      if (!coverPath) {
+        logger.info(`第 ${i + 1} 篇：未提供封面图，自动生成封面图...`);
+        try {
           coverPath = await WeChatPublisher.generateCoverImage(art.title, art.content);
+        } catch (genError) {
+          logger.warn(`第 ${i + 1} 篇：自动生成封面图失败`, { error: genError.message });
         }
-        if (coverPath) {
+      }
+
+      if (coverPath) {
+        try {
           thumbMediaId = await wechatAPI.uploadCoverImage(coverPath);
-          if (!art.coverImagePath && !coverImagePath) {
+          logger.info(`第 ${i + 1} 篇：封面图上传成功`, { mediaId: thumbMediaId });
+          // 仅当封面图是从URL下载或自动生成的临时文件时才清理
+          const isAutoGenOrUrl = !art.coverImagePath && !(i === 0 && coverImagePath);
+          if (isAutoGenOrUrl) {
             const fs = await import('fs/promises');
             await fs.default.unlink(coverPath).catch(() => {});
           }
+        } catch (uploadErr) {
+          logger.warn(`第 ${i + 1} 篇：封面图上传失败`, { error: uploadErr.message });
+          // 封面图上传失败则抛出，因为多图文模式每篇都需要 thumb_media_id
+          throw new Error(`第 ${i + 1} 篇文章封面图上传失败: ${uploadErr.message}`);
         }
+      } else {
+        throw new Error(`第 ${i + 1} 篇文章缺少封面图，微信多图文模式下每篇文章都必须提供封面图`);
       }
 
       processedArticles.push({
@@ -246,6 +336,32 @@ class WeChatPublisher {
     return message;
   }
 
+ static async downloadImage(url) {
+  const fs = await import('fs/promises');
+  const path = await import('path');
+  const os = await import('os');
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`图片下载失败: ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  // 简单判断格式（默认png）
+  let ext = 'png';
+  if (url.includes('.jpg') || url.includes('.jpeg')) ext = 'jpg';
+
+  const filePath = path.default.join(
+    os.tmpdir(),
+    `wechat-cover-${Date.now()}.${ext}`
+  );
+
+  await fs.writeFile(filePath, buffer);
+
+  return filePath;
+ }
   /**
    * 根据文章内容自动生成封面图
    * @param {string} title 文章标题

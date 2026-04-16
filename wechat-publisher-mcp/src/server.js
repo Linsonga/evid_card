@@ -40,7 +40,8 @@ server.registerTool(
         title: z.string().describe("文章标题"),
         content: z.string().describe("Markdown格式的文章内容"),
         author: z.string().optional().describe("作者名称"),
-        coverImagePath: z.string().optional().describe("封面图片路径")
+        coverImagePath: z.string().optional().describe("封面图片本地路径"),
+        coverImageUrl: z.string().optional().describe("封面图片URL")
       })).optional(),
 //      title: z.string().describe("文章标题"),
 //      content: z.string().describe("Markdown格式的文章内容"),
@@ -64,6 +65,41 @@ server.registerTool(
         content: [{
           type: "text",
           text: `❌ 发布失败: ${error.message}`
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
+// 注册保存草稿工具
+server.registerTool(
+  "wechat_save_draft",
+  {
+    description: "将文章保存为微信公众号草稿（不发布），用于在后台预览排版效果",
+    inputSchema: {
+      articles: z.array(z.object({
+        title: z.string().describe("文章标题"),
+        content: z.string().describe("Markdown格式的文章内容"),
+        author: z.string().optional().describe("作者名称"),
+        coverImagePath: z.string().optional().describe("封面图片本地路径"),
+        coverImageUrl: z.string().optional().describe("封面图片URL")
+      })).describe("文章列表（支持多图文，最多8篇）"),
+      appId: z.string().describe("微信公众号AppID"),
+      appSecret: z.string().describe("微信公众号AppSecret")
+    }
+  },
+  async (params) => {
+    logger.info(`Saving ${params.articles?.length || 1} article(s) to draft`);
+    try {
+      const result = await WeChatPublisher.saveToDraft(params);
+      return result;
+    } catch (error) {
+      logger.error(`保存草稿失败: ${error.message}`);
+      return {
+        content: [{
+          type: "text",
+          text: `❌ 保存草稿失败: ${error.message}`
         }],
         isError: true
       };

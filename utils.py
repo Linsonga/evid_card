@@ -90,6 +90,156 @@ async def request_qwen_async(system_prompt, user_prompt):
     return completion.choices[0].message.content
 
 
+
+
+def generate_ai_cover_dashscope_api(title, output_dir="images/covers"):
+    """
+    按照 DashScope 官方 REST API 示例修改的生图函数
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    # 1. 配置信息 (建议将 API Key 存入环境变量)
+    api_key = QWEN_API_KEY  # 或者直接使用你的 QWEN_API_KEY
+    url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    # 2. 构造提示词
+    prompt = f"""你是一名医学科普插画设计师。
+
+根据给定主题生成一张封面插画描述（用于AI绘图）。
+
+【输入主题】
+{title}
+
+【要求】
+1. 仅提取 2–3 个最核心医学关键词（不要超过3个）
+2. 每个关键词只对应一个简单视觉元素（避免复杂组合）
+3. 画面只保留一个中心主体，其余为极少量辅助元素
+4. 风格必须：扁平插画 + 极简主义 + 医学科普风
+5. 配色：明亮柔和（蓝 / 绿 / 白），避免多色混乱
+6. 背景：干净留白，不添加复杂细节
+7. 图片文字：
+   - 仅保留一个主标题（通俗表达）
+   - 可选一个简短副标题（1个关键词即可）
+   - 严禁长句
+"""
+
+    # 3. 构造请求体 (完全参考你的 cURL 示例)
+    payload = {
+        "model": "wan2.7-image-pro",  # 使用示例中的新模型
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": prompt}
+                    ]
+                }
+            ]
+        },
+        "parameters": {
+            "size": "1280*720",  # 也可以根据需求设为 "2K"
+            "n": 1,
+            "watermark": False,
+            "thinking_mode": True  # 开启思考模式，生成质量更高
+        }
+    }
+
+    try:
+        # 4. 发起 POST 请求
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        result = response.json()
+
+        # 5. 解析响应结果
+        # 注意：REST API 返回的结果层级通常为 result['output']['results'][0]['url']
+        if response.status_code == 200:
+            # image_url = result.get("output", {}).get("results", [{}])[0].get("url")
+
+            image_url = (
+                result.get("output", {})
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", [{}])[0]
+                .get("image")
+            )
+
+            if not image_url:
+                print(f"⚠️ 未获取到图片 URL: {result}")
+                return None
+
+            # 6. 下载并保存
+            img_data = requests.get(image_url).content
+            safe_title = "".join(c for c in title if c.isalnum())[:20]
+            # timestamp = int(datetime.now().timestamp())
+            file_name = f"{safe_title}.png"
+            file_path = os.path.join(output_dir, file_name)
+
+            with open(file_path, "wb") as f:
+                f.write(img_data)
+
+            return os.path.abspath(file_path)
+        else:
+            print(f"❌ API 请求失败: {response.status_code}, {response.text}")
+            return None
+
+    except Exception as e:
+        print(f"❌ AI 生图函数异常: {e}")
+        return None
+
+
+
+# def generate_ai_cover_openai(title, output_dir="images/covers"):
+#     """
+#     使用 OpenAI SDK 兼容模式调用阿里云通义万相生成封面图
+#     :param title: 文章标题，用于生成 Prompt
+#     :param api_key: 阿里云 DashScope API Key
+#     :param output_dir: 本地存储目录
+#     :return: 成功返回图片的绝对路径，失败返回 None
+#     """
+#     if not os.path.exists(output_dir):
+#         os.makedirs(output_dir, exist_ok=True)
+#
+#     # 1. 初始化兼容 OpenAI 的客户端
+#     client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+#
+#     # 2. 构造适合医疗/科普背景的提示词
+#     prompt = f"提取主题中关键词，生成一张扁平插画风格的健康科普封面，主题关于：{title}，色彩明亮柔和，极简主义，高清，无文字"
+#
+#     try:
+#         # 3. 发起生图请求
+#         response = client.images.generate(
+#             model="wan2.1-t2i-plus",
+#             prompt=prompt,
+#             n=1,
+#             size="1440x612"  # 通义万相支持的尺寸
+#         )
+#
+#         image_url = response.data[0].url
+#         if not image_url:
+#             return None
+#
+#         # 4. 下载并保存
+#         img_data = requests.get(image_url).content
+#         # 处理文件名：移除非法字符
+#         safe_title = "".join(c for c in title if c.isalnum())[:20]
+#         timestamp = int(datetime.now().timestamp())
+#         file_name = f"cover_{safe_title}_{timestamp}.png"
+#         file_path = os.path.join(output_dir, file_name)
+#
+#         with open(file_path, "wb") as f:
+#             f.write(img_data)
+#
+#         return os.path.abspath(file_path)
+#
+#     except Exception as e:
+#         print(f"❌ AI 生图函数异常: {e}")
+#         return None
+
 # ================= JSON 工具 =================
 
 def extract_json_from_text(text):

@@ -188,41 +188,74 @@ class PDFParsing():
 
         return res, image
 
-
-    def ocr(self, images, lang='ch'):
+    def ocr(self, images, lang='ch', batch_size=16):
         """
-        识别文字
-        :param lang: 目前支持的多语言语种. 例如`ch`, `en`,
-        :return:
+        识别文字，增加 batch_size 控制，防止 OOM
         """
-
-        images = [cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR) for image in images]
-
-        if lang == 'en':
-            result = self.en_ocr_pipeline.predict(
-                input=images,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=True,
-            )
-        else:
-            result = self.cn_ocr_pipeline.predict(
-                input=images,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=True,
-            )
         text_lis = []
-        for res in result:
+        # 将传入的所有小图，按照 batch_size (比如每次 16 张) 切分处理
+        for i in range(0, len(images), batch_size):
+            batch_images = images[i: i + batch_size]
+            batch_images = [cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR) for img in batch_images]
 
             if lang == 'en':
-                ocr_text = ' '.join(res['rec_texts']).replace('-  ', '').replace('- ', '').strip()
+                result = self.en_ocr_pipeline.predict(
+                    input=batch_images,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=True,
+                )
             else:
-                ocr_text = ''.join(res['rec_texts']).strip()
+                result = self.cn_ocr_pipeline.predict(
+                    input=batch_images,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=True,
+                )
 
-            text_lis.append(ocr_text)
+            for res in result:
+                if lang == 'en':
+                    ocr_text = ' '.join(res['rec_texts']).replace('-  ', '').replace('- ', '').strip()
+                else:
+                    ocr_text = ''.join(res['rec_texts']).strip()
+                text_lis.append(ocr_text)
 
         return text_lis
+
+    # def ocr(self, images, lang='ch'):
+    #     """
+    #     识别文字
+    #     :param lang: 目前支持的多语言语种. 例如`ch`, `en`,
+    #     :return:
+    #     """
+    #
+    #     images = [cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR) for image in images]
+    #
+    #     if lang == 'en':
+    #         result = self.en_ocr_pipeline.predict(
+    #             input=images,
+    #             use_doc_orientation_classify=False,
+    #             use_doc_unwarping=False,
+    #             use_textline_orientation=True,
+    #         )
+    #     else:
+    #         result = self.cn_ocr_pipeline.predict(
+    #             input=images,
+    #             use_doc_orientation_classify=False,
+    #             use_doc_unwarping=False,
+    #             use_textline_orientation=True,
+    #         )
+    #     text_lis = []
+    #     for res in result:
+    #
+    #         if lang == 'en':
+    #             ocr_text = ' '.join(res['rec_texts']).replace('-  ', '').replace('- ', '').strip()
+    #         else:
+    #             ocr_text = ''.join(res['rec_texts']).strip()
+    #
+    #         text_lis.append(ocr_text)
+    #
+    #     return text_lis
 
 
     def table_recognize(self, image, lang='ch'):
@@ -271,11 +304,34 @@ class PDFParsing():
         # input()
         data_lis = []
 
-        pdf_images = self.pdf_to_image(pdf_path)
+        doc = fitz.open(pdf_path)
+        dpi = 200
 
-        for page_id in range(len(pdf_images)):
-            print(page_id, flush=True)
-            res_structure, image = self.layout(pdf_images[page_id])
+        # pdf_images = self.pdf_to_image(pdf_path)
+
+        for page_id in range(len(doc)):
+            print(f"Processing page: {page_id}", flush=True)
+
+            # --- 以下为新增的逐页渲染图片逻辑，用完即毁 ---
+            page = doc[page_id]
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
+            image_pil = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
+
+            if pix.width > 3000 or pix.height > 3000:
+                pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
+                image_pil = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
+
+            np_image = np.array(image_pil)[:, :, ::-1]
+
+            # 及时释放 pymupdf 对象，防止内存泄露
+            page = None
+            pix = None
+            # --- 逐页渲染结束 ---
+
+            # 使用当前生成的单页图片进行排版分析
+            res_structure, image = self.layout(np_image)
+
+
             res_structure_num = len(res_structure)
             structure_lis = []
             temp_lis = []
@@ -330,7 +386,13 @@ class PDFParsing():
             if len(structure_lis) > 0:
                 res_texts = self.ocr(structure_lis, lang)
                 data_lis.extend(self.ocr_post_process(res_texts, temp_lis))
-            # input()
+
+            del np_image
+            del image
+            import gc
+            gc.collect()
+
+        doc.close()
 
         return data_lis, lang
 
