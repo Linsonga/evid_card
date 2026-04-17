@@ -416,14 +416,14 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
                 "text":      text,
                 "date":  str(int(time.time())),
                 "user_id":   user_id,
-                "file_name": file_name,
+                "file_id": file_id,  # 🌟 修改：这里存入 file_id，取代之前的 file_name
             }]
             milvus_client.insert(collection_name=MILVUS_COLLECTION_MAIN, data=to_insert)
 
             # 🌟 收集有效数据供大模型挖掘使用
             valid_embeddings.append(embeddings_list)
             valid_texts.append(text)
-            valid_metadata.append(f"来源文件: {file_name}")
+            valid_metadata.append(f"来源文件ID: {file_id}")  # 🌟 修改：素材标识也改成 ID
 
     except Exception as e:
         return {"status": "error", "msg": f"Milvus 入库失败: {str(e)}"}
@@ -625,7 +625,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             )
             db_result = process_and_insert_to_milvus(
                 task_id, chunked_data, batch_id=batch_id, type='txt',
-                user_id=user_id, file_name=file_name
+                user_id=user_id, file_id=file_id
             )
 
         # ===== 分支二：PDF / xmind(PDF导出) 文件 =====
@@ -653,7 +653,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 )
                 db_result = process_and_insert_to_milvus(
                     task_id, chunked_data, batch_id=batch_id, type='xmind',
-                    user_id=user_id, file_name=file_name
+                    user_id=user_id, file_id=file_id
                 )
 
 
@@ -675,7 +675,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
 
                 # 3. 向量化并入库（共用 batch_id）
                 print(f"[批次 {batch_id}] 任务 {task_id} 开始入库...")
-                db_result = process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_name=file_name)
+                db_result = process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_id=file_id)
 
         # --- 判定 Milvus 入库结果 ---
         if isinstance(db_result, dict) and db_result.get("status") == "success":
