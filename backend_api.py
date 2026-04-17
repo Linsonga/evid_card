@@ -27,6 +27,16 @@ from pymilvus import MilvusClient
 
 from config import DB_CONFIG, MILVUS_MAIN_URI, MILVUS_MAIN_TOKEN
 from utils import vector_4b, request_qwen_async
+# 🌟 新增导入：KMeans, numpy 和 JSON提取工具
+import numpy as np
+from sklearn.cluster import KMeans
+from utils import vector_4b, request_qwen_async, extract_json_array_from_text
+
+import glob
+from multi_pdf_to_json_queue import PDFParsing, LAYOUT_PATH
+from matcher import QwenEmbeddingMatcher
+from audit import AgenticPipeline
+
 
 app = FastAPI(title="文件处理回调接口")
 
@@ -36,8 +46,10 @@ MILVUS_COLLECTION_MAIN = 'evidence_card_4B'
 BASE_DIR   = os.path.join(os.getcwd(), "api_data")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 RESULT_DIR = os.path.join(BASE_DIR, "results")
+STATE_DIR  = os.path.join(os.getcwd(), "task_states")  # 🌟 新增这一行
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(STATE_DIR, exist_ok=True)  # 🌟 新增创建目录
 
 # Milvus 客户端
 milvus_client = MilvusClient(uri=MILVUS_MAIN_URI, token=MILVUS_MAIN_TOKEN)
@@ -62,49 +74,12 @@ class FileCallbackItem(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     global pdf_parser_engine
-    global global_matcher, global_pipeline  # 🌟 引入全局变量
-
     # print("正在加载 YOLO 和 OCR 模型入显存...")
-    # pdf_parser_engine = PDFParsing(layout_path=LAYOUT_PATH)
+    pdf_parser_engine = PDFParsing(layout_path=LAYOUT_PATH)
     print("模型加载完毕，API 准备就绪！")
 
-    # 🌟 新增：在系统启动时，且仅在启动时，初始化一次！
-    print("🚀 正在初始化全局专区匹配器与质检大脑，请稍候...")
-    global_matcher = QwenEmbeddingMatcher()
-    global_pipeline = AgenticPipeline()
-    print("✅ 全局匹配器和质检管道初始化完成！内存加载完毕。")
-
-    # 🌟 新增：清理僵尸任务逻辑 🌟
-    print("正在清理上次异常退出的僵尸任务...")
-    try:
-        # 启动 MongoDB 监听任务 (非阻塞)
-        # asyncio.create_task(mongo_polling_worker())
-
-        # 扫描 task_states 目录下所有的 json 文件
-        state_files = glob.glob(os.path.join(STATE_DIR, "*.json"))
-        cleaned_count = 0
-        for filepath in state_files:
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-
-                # 如果服务刚启动，发现有任务还是 running，说明是上次异常崩溃遗留的
-                if state.get("status") == "running":
-                    state["status"] = "interrupted"  # 改为中断状态
-                    state["msg"] = "检测到服务曾意外终止，任务已挂起，可通过传入 task_id 续传。"
-
-                    with open(filepath, "w", encoding="utf-8") as f:
-                        json.dump(state, f, ensure_ascii=False, indent=2)
-                    cleaned_count += 1
-            except Exception:
-                continue
-        if cleaned_count > 0:
-            print(f"✅ 成功将 {cleaned_count} 个僵尸任务重置为挂起状态，现在可以正常断点续传了！")
-    except Exception as e:
-        print(f"清理僵尸任务失败: {e}")
 
 # ================= 辅助函数 =================
-
 def is_garbage_text(text: str) -> bool:
     """判断是否为乱码/无意义文本（OCR失败、纯公式、全是乱码符号）"""
     if len(text) < 50:
@@ -138,6 +113,64 @@ def is_garbage_text(text: str) -> bool:
     else:
         # 既不像中文也不像英文，判为乱码
         return True
+
+# ================= 修改mysql状态 =================
+def update_file_parse_status(file_id: int, status: int):
+    """
+    更新 evidence_file_info 表的解析状态
+    status: 1-解析完成；2-解析失败
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        sql = "UPDATE evidence_file_info SET file_status = %s WHERE id = %s"
+        cursor.execute(sql, (status, file_id))
+        conn.commit()
+        print(f"[DB LOG] 文件ID {file_id} 状态更新为 {status}")
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"[DB ERROR] 更新文件状态失败: {e}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+# ================= 🌟 修改点 2：新增分批存库函数 =================
+def insert_file_card_names(file_id: int, user_id: int, card_names: list):
+    """
+    分批将大模型提炼的卡片标题写入 evidence_file_card_name 表
+    """
+    if not card_names:
+        return
+    conn = None
+    cursor = None
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        sql = """
+            INSERT INTO evidence_file_card_name (file_id, card_name, user_id, status)
+            VALUES (%s, %s, %s, 0)
+        """
+        # 构造批量插入的数据元组
+        insert_data = [(file_id, name, user_id) for name in card_names]
+        cursor.executemany(sql, insert_data)
+        conn.commit()
+        print(f"[DB LOG] 成功为文件ID {file_id} 插入 {cursor.rowcount} 个新卡片标题！")
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"[DB ERROR] 插入卡片标题失败: {e}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 def is_chinese_or_english(text, threshold=0.05):
@@ -352,6 +385,11 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
         return {"status": "error", "msg": "没有有效的分块数据可供插入"}
 
     filtered_count = 0
+    # 🌟 新增三个列表，用于收集有效数据
+    valid_embeddings = []
+    valid_texts = []
+    valid_metadata = []
+
     try:
         for index, item in enumerate(chunked_data):
             text = item.get("text", "").strip()
@@ -376,20 +414,194 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
                 "vector":    embeddings_list,
                 "batch_id":  batch_id,
                 "text":      text,
-                "date":      str(time.time()),
+                "date":  str(int(time.time())),
                 "user_id":   user_id,
                 "file_name": file_name,
             }]
             milvus_client.insert(collection_name=MILVUS_COLLECTION_MAIN, data=to_insert)
 
+            # 🌟 收集有效数据供大模型挖掘使用
+            valid_embeddings.append(embeddings_list)
+            valid_texts.append(text)
+            valid_metadata.append(f"来源文件: {file_name}")
+
     except Exception as e:
         return {"status": "error", "msg": f"Milvus 入库失败: {str(e)}"}
 
-    return {"status": "success", "filtered_count": filtered_count}
+    # 🌟 修改返回结构：将数据一同返回
+    return {
+        "status": "success",
+        "filtered_count": filtered_count,
+        "embeddings": valid_embeddings,
+        "texts": valid_texts,
+        "metadata": valid_metadata
+    }
 
+
+# ================= 🌟 修改点 4：新增卡片提炼核心逻辑 =================
+async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list: list, texts: list, metadata: list):
+    """基于向量聚类与大模型，智能提炼卡片标题"""
+    TARGET_TOTAL_TITLES = 10  # 目标提取总数
+    BATCH_INSERT_SIZE = 5  # 每满 5 个插入一次数据库
+
+    num_chunks = len(embeddings_list)
+    if num_chunks == 0:
+        return
+
+    embeddings = np.array(embeddings_list)
+    # 根据文本分块数量动态决定聚类数量 (不用太多)
+    N_CLUSTERS = max(1, min(num_chunks // 2, 5))
+
+    print(f"[{file_id}] 开始进行 KMeans 聚类 (簇数量: {N_CLUSTERS})...")
+    kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init="auto")
+    kmeans.fit(embeddings)
+
+    clusters_pool = {i: [] for i in range(N_CLUSTERS)}
+    for idx, label in enumerate(kmeans.labels_):
+        clusters_pool[label].append({
+            "text": texts[idx],
+            "source": metadata[idx],
+        })
+
+    history_topics = []
+    accumulated_for_db = []
+    total_generated = 0
+
+    system_prompt = '你现在是“医学证据卡片选题总编 + 临床知识编辑 + 循证医学研究员 + 医生知识资产工程师”。'
+
+    for cluster_id, items in clusters_pool.items():
+        if total_generated >= TARGET_TOTAL_TITLES:
+            break  # 已达成总目标，跳出循环
+
+        current_materials_str = ""
+        # 提取簇内的精华内容作为素材
+        for rank, item in enumerate(items[:20]):
+            current_materials_str += f"片段{rank + 1} [{item['source']}]: {item['text']}\n"
+
+        history_str = "\n".join(history_topics) if history_topics else "无"
+
+        dynamic_user_prompt = f"""
+        【历史选题黑名单】（绝对禁止重复以下方向或题目）：
+        {history_str}
+
+        【本次挖掘素材】：
+        {current_materials_str}
+
+        【你的任务】：
+        你的任务是基于上述【本次挖掘素材】，为医生生产证据卡片【设计选题池】。
+        你的最高目标有五个：
+        1. 每张卡片必须服务于一个明确的临床决策。
+        2. 吸收医生资料、思维导图、医案等。
+        3. 必须有明显循证属性（量化指标、证据等级）。
+        4. 产出未来可外挂给大模型用于辅助决策的知识资产。
+        5. 绝不能与【历史选题黑名单】在临床决策点上重复！如果你发现本次素材只能生成与黑名单高度相似的选题，请放弃生成，直接输出空数组 []。
+
+        一、必须使用的资料范围
+        你必须优先并显式整合以下来源来挖掘选题：
+        A. 我上传的医生资料（若有）包括但不限于：决策树/思维导图/医案/书籍/证据卡片示例/研究资料/指南整理稿/症状评分表/胃镜病理评分表
+        B. 联网搜索
+        你必须检索最新公开资料寻找选题灵感，尤其包括：最新国内外指南/专家共识/系统综述/Meta分析/RCT/高质量观察性研究/真实世界研究/疾病管理规范/近3-5年高质量综述
+        C. 学术搜索
+        优先检索：PubMed/Google Scholar/Cochrane/国内核心数据库可公开获得部分/指南发布机构官网/学协会官网
+
+        二、你对上传资料的使用原则（挖掘选题的依据）
+        1. 决策树 / 思维导图的作用：把它视为“医生显性化诊疗逻辑”。提取风险因素分层、症状识别路径、辅助检查路径等，这决定“临床推理顺序”。
+        2. 医案与书籍的作用：把它们视为“医生隐性经验的文本化载体”。提取核心病机、理法方药对应关系、误治/漏治等，这决定“为什么这样治”。
+        3. 指南与文献的作用：把它们视为“校准器”和“证据增强器”。提取推荐意见、证据等级、与医生经验一致和不一致之处。
+        4. 既有证据卡片样例的作用：借用其成品感、医生阅读友好度、栏目意识。
+
+        三、选题机制：先选题，再写卡片
+        在正式写证据卡片前，你必须先做“选题推演”。
+        每次选题时，先在我上传资料、联网结果和学术搜索结果中提取选题池，然后按照以下九类角度生成候选题目：
+
+        1. 决策冲突型:围绕医生最容易犹豫的点来选题。例如：什么时候以清热化湿为先，什么时候先健脾和胃；某症状背后究竟更偏气滞、湿热、阴虚还是瘀阻；同类表现如何区分不同治法路径。
+        2. 鉴别诊断型:围绕“看起来像，但处理不同”的问题来选题。重点写：相似主诉、关键分叉点、舌脉/胃镜/病理/病程/诱因的区别、误判的临床后果。
+        3. 病机拆解型:围绕一个复杂病机或关键病机来选题。重点写：核心病机是什么、当前主要病机是什么、为什么不能只盯一个证型、病机转化后治法如何变化。
+        4. 症状切入口型:围绕临床高频、但背后病机不单一的症状来选题。例如：烧心、胃脘胀满、胃脘刺痛、嗳气、咽堵、纳呆、背沉背痛。但必须写出“同一症状，不同处理路径”。
+        5. 检查结果驱动型:围绕胃镜、病理、幽门螺杆菌、胆汁反流、萎缩、肠化、异型增生等结果来选题。重点写：某检查发现如何改变辨证权重、某病理结果如何改变随访和干预优先级、某结果出现后治法是否应升级或调整。
+        6. 用药决策型:围绕“什么情况下加什么、减什么、避什么”来选题。重点写：加减触发条件、药物配伍逻辑、与基础方的关系、剂量侧重、安全边界。不能只罗列药物。
+        7. 预后与随访型:围绕“什么时候需要更密切随访、什么时候可观察、什么指标提示风险上升”来选题。重点写：病程风险、复查触发条件、干预有效性的判定指标。
+        8. 生活方式干预型:围绕饮食、情志、作息、分餐、戒烟、低盐、劳逸等内容来选题。必须把它做成“能影响决策质量的内容”，而不是泛泛养生建议。
+        9. 经验-证据碰撞型:围绕医生经验与现代循证之间一致的地方、不一致的地方、互补的地方来选题。这类题目最容易形成差异化内容和讨论价值。
+
+        四、选题去同质化规则
+        你必须把“避免千篇一律”当作硬约束。每个专区内连续生成多张卡片时，禁止出现以下情况：
+        - 连续多张都用同一题目句式
+        - 连续多张都以“某某证治疗方案”命名
+        - 连续多张都只是在症状、证型、方药上做替换
+        - 连续多张都采用同一种切入角度
+        - 连续多张的核心段落结构几乎一致
+        - 连续多张都只讲治疗，不讲鉴别与边界
+        - 连续多张都没有明确的证据指标
+
+        你必须主动拉开差异，至少从以下维度错开：题目句式、切入角度、问题层级、病机层级、检查层级、决策层级、证据层级、适用人群层级、写作重心。
+        题目允许的风格应该是多样的，例如：决策判断式、鉴别分析式、证据比较式、病机拆解式、治疗时机式、误区纠偏式、随访管理式、药物加减式、检查结果解读式。但无论题目风格如何变化，都必须最终落到可执行的临床决策上。
+
+        🌟 【标题字数与精炼红线】（最高优先级）：
+        医生在手机上浏览专区时，标题必须极度精简、一目了然。
+        1. 每个卡片标题的字数必须严格控制在 10 到 15 个字之间！
+        2. 剔除所有不必要的连接词、助词和冗长的状语，提炼核心医学实体。
+        3. 严禁使用提问式的长复句。
+        【错误示范（35字）】：肝硬化腹水患者体位变化对心输出量和血管阻力的影响是否影响利尿剂使用时机
+        【正确示范（13字）】：肝硬化腹水体位与利尿剂时机
+        【错误示范（22字）】：幽门螺杆菌根除后针对不同病理类型的随访策略
+        【正确示范（14字）】：Hp根除后不同病理随访策略
+        
+        五、最终输出要求（仅输出选题清单）
+        每次先给出一组候选题目（建议5-8个）。
+        
+        【本轮任务】
+        1. 输出 5-10 个证据卡片候选选题清单。
+        2. 绝对禁止出现任何中文或英文标点符号。
+        3. 严格遵守 10-15 字的字数限制。
+        4. 请仔细对比【历史选题黑名单】，主动拉开差异。
+        5. 请严格输出一个标准的JSON数组格式，单占一行，必须使用双引号，格式如下：["标题1", "标题2", "标题3"]。
+        如果实在没有新角度，输出 []。
+        """
+
+        try:
+            # 请求大模型
+            topics_raw = await request_qwen_async(system_prompt, dynamic_user_prompt)
+
+            # 解析 JSON 数组
+            try:
+                new_topics = extract_json_array_from_text(topics_raw)
+            except Exception:
+                # 兜底解析
+                match = re.search(r'\[.*\]', topics_raw, re.DOTALL)
+                new_topics = json.loads(match.group(0)) if match else []
+
+            if not new_topics:
+                continue
+
+            # 字面过滤黑名单，防止完全重复
+            valid_new_topics = [t for t in new_topics if t not in history_topics]
+
+            for topic in valid_new_topics:
+                if total_generated >= TARGET_TOTAL_TITLES:
+                    break
+                history_topics.append(topic)
+                accumulated_for_db.append(topic)
+                total_generated += 1
+
+                # 🌟 每满 5 个插入一次
+                if len(accumulated_for_db) >= BATCH_INSERT_SIZE:
+                    insert_file_card_names(file_id, user_id, accumulated_for_db)
+                    accumulated_for_db.clear()
+
+            # 短暂等待以防止 Qwen 频控限制
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            print(f"[卡片标题 LLM 生成异常]: {e}")
+
+    # 如果最后还有剩余未能满足 5 个的元素，一次性清空插入
+    if accumulated_for_db:
+        insert_file_card_names(file_id, user_id, accumulated_for_db)
+        accumulated_for_db.clear()
 
 # ================= 批次后台处理任务 =================
-async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: str, user_id: str = '', file_name: str = ''):
+async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: str, user_id: str = '', file_name: str = '', file_id: int = 0):
     """
     批次模式后台处理：解析本地文件 -> 分块 -> 向量化入库（共享 batch_id）
     支持文件类型：PDF（含xmind导出）、TXT
@@ -453,7 +665,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                     data_lis, detected_lang = await loop.run_in_executor(
                         None,
                         pdf_parser_engine.pdf_parsing,
-                        pdf_path,
+                        file_path,
                         None,
                         False
                     )
@@ -465,18 +677,25 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 print(f"[批次 {batch_id}] 任务 {task_id} 开始入库...")
                 db_result = process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_name=file_name)
 
-                # print(f"普通文本")
-                # # 普通文本 PDF：使用 pdfplumber 逐页提取文本 -> 分块入库
-                # data_lis = extract_text_from_pdf_with_plumber(file_path)
-                # if data_lis:
-                #     combined      = "".join(item.get("text", "") for item in data_lis)
-                #     detected_lang = is_chinese_or_english(combined)
-                # chunked_data = chunk_text_data(data_lis, split_to_length=400)
-                #
-                # db_result    = process_and_insert_to_milvus(
-                #     task_id, chunked_data, batch_id=batch_id, type='pdf',
-                #     user_id=user_id, file_name=file_name
-                # )
+        # --- 判定 Milvus 入库结果 ---
+        if isinstance(db_result, dict) and db_result.get("status") == "success":
+            # 🌟 全部流程成功：更新数据库状态为 1
+            update_file_parse_status(file_id, 1)
+
+            # 🌟 新增：触发卡片标题提炼
+            embeddings = db_result.get("embeddings", [])
+            texts = db_result.get("texts", [])
+            metadata = db_result.get("metadata", [])
+
+            if embeddings:
+                print(f"[批次 {batch_id}] 任务 {task_id} 向量入库完毕，开始智能提炼卡片标题...")
+                # user_id 强转为 int 方便落库
+                await mine_card_titles_for_file(file_id, int(user_id), embeddings, texts, metadata)
+                print(f"[批次 {batch_id}] 任务 {task_id} 卡片标题提炼全部完成！")
+        else:
+            # 入库环节显式返回失败：更新状态为 2
+            update_file_parse_status(file_id, 2)
+
 
         # 保存任务完成状态
         result_data = {
@@ -493,6 +712,10 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
 
     except Exception as e:
         print(f"[批次 {batch_id}] 任务 {task_id} 失败: {str(e)}")
+
+        # 🌟 捕获任何阶段的异常（下载后解析失败、分块失败等）：更新状态为 2
+        update_file_parse_status(file_id, 2)
+
         error_data = {
             "task_id":   task_id,
             "batch_id":  batch_id,
@@ -601,8 +824,13 @@ async def create_upload_batch_from_url(
 
         # ── 步骤 4：加入后台解析队列（解析 + 分块 + 入库，共用 batch_id）──
         background_tasks.add_task(
-            background_process_pdf_batch, task_id, batch_id, final_path,
-            file.user_id, file_name
+            background_process_pdf_batch,
+            task_id,
+            batch_id,
+            final_path,
+            file.user_id,
+            file_name,
+            file.id  # 传入文件ID
         )
         task_list.append({
             "task_id":  task_id,

@@ -47,9 +47,9 @@ from filelock import FileLock
 import shutil
 from pathlib import Path
 
-# layout_path = "/root/autodl-tmp/GLS/model/"
-# layout_path = "/root/Data/rlj/ocrV5/model/"
-LAYOUT_PATH = "/root/autodl-tmp/evidence_card_online/model/"
+# LAYOUT_PATH = "/root/autodl-tmp/GLS/model/"
+LAYOUT_PATH = "/root/Data/rlj/ocrV5/model/"
+# LAYOUT_PATH = "/root/autodl-tmp/evidence_card_online/model/"
 SAVE_PATH = '/root/Data/GLS/evidence_card/'
 
 class PDFParsing():
