@@ -30,7 +30,8 @@ from utils import vector_4b, request_qwen_async
 # 🌟 新增导入：KMeans, numpy 和 JSON提取工具
 import numpy as np
 from sklearn.cluster import KMeans
-from utils import vector_4b, request_qwen_async, extract_json_array_from_text
+from sklearn.metrics.pairwise import cosine_similarity  # 🌟 新增相似度计算库
+from utils import vector_4b, request_qwen_async, extract_json_array_from_text, get_cached_vector
 
 import glob
 from multi_pdf_to_json_queue import PDFParsing, LAYOUT_PATH
@@ -114,6 +115,26 @@ def is_garbage_text(text: str) -> bool:
         # 既不像中文也不像英文，判为乱码
         return True
 
+# ================= 🌟 修改点 2：新增获取历史卡片函数 =================
+def get_user_history_titles(user_id: int) -> list:
+    """从数据库中获取该用户之前生成的所有卡片标题"""
+    conn = None
+    cursor = None
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute("SELECT card_name FROM evidence_file_card_name WHERE user_id = %s", (user_id,))
+        rows = cursor.fetchall()
+        return [row[0] for row in rows] if rows else []
+    except Exception as e:
+        print(f"[DB ERROR] 获取用户历史卡片失败: {e}")
+        return []
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
 # ================= 修改mysql状态 =================
 def update_file_parse_status(file_id: int, status: int):
     """
@@ -154,11 +175,17 @@ def insert_file_card_names(file_id: int, user_id: int, card_names: list):
         cursor = conn.cursor()
 
         sql = """
-            INSERT INTO evidence_file_card_name (file_id, card_name, user_id, status)
-            VALUES (%s, %s, %s, 0)
+            INSERT INTO evidence_file_card_name (file_id, card_name, name_info, user_id, status, name_repeat)
+            VALUES (%s, %s, %s, %s, 0, %s)
         """
+        # 修改：元组中增加 item.get("name_repeat", 0)
+        insert_data = [
+            (file_id, item["title"], item["reason"], user_id, item.get("name_repeat", 0))
+            for item in card_names
+        ]
+
         # 构造批量插入的数据元组
-        insert_data = [(file_id, name, user_id) for name in card_names]
+        # insert_data = [(file_id, item["title"], item["reason"], user_id) for item in cards]
         cursor.executemany(sql, insert_data)
         conn.commit()
         print(f"[DB LOG] 成功为文件ID {file_id} 插入 {cursor.rowcount} 个新卡片标题！")
@@ -246,6 +273,8 @@ def detect_pdf_type(pdf_path: str) -> str:
     except Exception as e:
         print(f"检测 PDF 类型失败: {e}")
         return "text"
+
+
 
 
 def extract_xmind_to_text(pdf_path):
@@ -372,6 +401,7 @@ def convert_docx_to_pdf_sync(docx_path: str, output_dir: str):
         raise Exception("找不到 soffice 命令，请确保服务器安装了 LibreOffice 并配置了环境变量")
 
 
+
 def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str = None, type: str = 'pdf', user_id: str = '', file_name: str = ''):
     """
     遍历分块数据，调用 Embedding 接口，批量写入 Milvus。
@@ -463,7 +493,18 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
             "source": metadata[idx],
         })
 
-    history_topics = []
+    # 1. 提前拉取该用户在数据库中已有的所有卡片标题
+    existing_db_titles = get_user_history_titles(user_id)
+    history_topics = list(set(existing_db_titles))  # 作为防重名黑名单
+
+    # 2. 将历史标题转化为向量，利用 utils 的 get_cached_vector (会自动读本地文件)
+    history_embeddings = []
+    print(f"[{file_id}] 正在加载用户历史卡片的向量用于防重叠比对...")
+    for t in history_topics:
+        vec = get_cached_vector(t)
+        if vec:
+            history_embeddings.append(vec)
+
     accumulated_for_db = []
     total_generated = 0
 
@@ -537,7 +578,7 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
         你必须主动拉开差异，至少从以下维度错开：题目句式、切入角度、问题层级、病机层级、检查层级、决策层级、证据层级、适用人群层级、写作重心。
         题目允许的风格应该是多样的，例如：决策判断式、鉴别分析式、证据比较式、病机拆解式、治疗时机式、误区纠偏式、随访管理式、药物加减式、检查结果解读式。但无论题目风格如何变化，都必须最终落到可执行的临床决策上。
 
-        🌟 【标题字数与精炼红线】（最高优先级）：
+        【标题字数与精炼红线】（最高优先级）：
         医生在手机上浏览专区时，标题必须极度精简、一目了然。
         1. 每个卡片标题的字数必须严格控制在 10 到 15 个字之间！
         2. 剔除所有不必要的连接词、助词和冗长的状语，提炼核心医学实体。
@@ -551,11 +592,14 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
         每次先给出一组候选题目（建议5-8个）。
         
         【本轮任务】
-        1. 输出 5-10 个证据卡片候选选题清单。
+        1. 输出 10 个证据卡片候选选题。
         2. 绝对禁止出现任何中文或英文标点符号。
         3. 严格遵守 10-15 字的字数限制。
         4. 请仔细对比【历史选题黑名单】，主动拉开差异。
-        5. 请严格输出一个标准的JSON数组格式，单占一行，必须使用双引号，格式如下：["标题1", "标题2", "标题3"]。
+        5. 🌟 为每个卡片标题生成一个简短的原因说明（主要解释为什么从临床决策角度提取这个标题）。
+        6. 请严格输出一个标准的JSON数组格式，单占一行，必须使用双引号。
+        🌟 格式必须严格如下：
+        [{{"title": "标题1", "reason": "提取原因说明1"}},{{"title": "标题2", "reason": "提取原因说明2"}}]
         如果实在没有新角度，输出 []。
         """
 
@@ -574,17 +618,49 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
             if not new_topics:
                 continue
 
-            # 字面过滤黑名单，防止完全重复
-            valid_new_topics = [t for t in new_topics if t not in history_topics]
+            # 过滤黑名单并清洗数据格式
+            valid_new_topics = []
+            for item in new_topics:
+                if isinstance(item, dict) and "title" in item and "reason" in item:
+                    title = str(item["title"]).strip()
+                    reason = str(item["reason"]).strip()
 
-            for topic in valid_new_topics:
+                    if title and title not in history_topics:
+                        valid_new_topics.append({"title": title, "reason": reason})
+
+            for item in valid_new_topics:
                 if total_generated >= TARGET_TOTAL_TITLES:
                     break
-                history_topics.append(topic)
-                accumulated_for_db.append(topic)
+
+                title = item["title"]
+                name_repeat = 0  # 默认非重复
+
+                # 🌟 3. 核心：获取当前生成的标题的向量 (自动生成并写入本地 jsonl 缓存)
+                topic_vec_list = get_cached_vector(title)
+
+                # 🌟 4. 计算与历史库的相似度
+                if topic_vec_list and history_embeddings:
+                    topic_vec = np.array([topic_vec_list])
+                    history_mat = np.array(history_embeddings)
+                    similarities = cosine_similarity(topic_vec, history_mat)[0]
+                    max_sim = np.max(similarities)
+
+                    if max_sim > 0.82:
+                        print(f"⚠️ 触发防重叠机制: [{title}] 与历史相似度最高达 {max_sim:.2f}，标记为重复(1)。")
+                        name_repeat = 1
+
+                # 🌟 5. 将当前新向量加入到本轮上下文的历史库中，防止本轮自己生成重复卡片
+                if topic_vec_list:
+                    history_embeddings.append(topic_vec_list)
+
+                # 历史黑名单依然只记录 title
+                history_topics.append(item["title"])
+                item["name_repeat"] = name_repeat
+                # 数据库累加池存入完整的对象 {"title": ..., "reason": ...}
+                accumulated_for_db.append(item)
                 total_generated += 1
 
-                # 🌟 每满 5 个插入一次
+                # 每满 5 个插入一次
                 if len(accumulated_for_db) >= BATCH_INSERT_SIZE:
                     insert_file_card_names(file_id, user_id, accumulated_for_db)
                     accumulated_for_db.clear()
@@ -628,6 +704,24 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 user_id=user_id, file_id=file_id
             )
 
+        # 🌟 ===== 分支二：图片文件 (新增) =====
+        elif ext in ['.png', '.jpg', '.jpeg']:
+            print(f"[批次 {batch_id}] 任务 {task_id} 检测到图片类型，开始 OCR 识别...")
+            text_content = await extract_text_from_image(file_path)
+
+            if not text_content or not text_content.strip():
+                raise Exception("图片 OCR 识别未能提取到有效文本")
+
+            detected_lang = is_chinese_or_english(text_content)
+            # 组装成分块所需的格式
+            chunked_data = chunk_text_data(
+                [{"type": "text", "text": text_content}], split_to_length=400
+            )
+            # 入库，type 标记为 'image'
+            db_result = process_and_insert_to_milvus(
+                task_id, chunked_data, batch_id=batch_id, type='image',
+                user_id=user_id, file_id=file_id
+            )
         # ===== 分支二：PDF / xmind(PDF导出) 文件 =====
         else:
             pdf_type = detect_pdf_type(file_path)
@@ -690,6 +784,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             if embeddings:
                 print(f"[批次 {batch_id}] 任务 {task_id} 向量入库完毕，开始智能提炼卡片标题...")
                 # user_id 强转为 int 方便落库
+                # 生成卡片
                 await mine_card_titles_for_file(file_id, int(user_id), embeddings, texts, metadata)
                 print(f"[批次 {batch_id}] 任务 {task_id} 卡片标题提炼全部完成！")
         else:
@@ -731,8 +826,117 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             os.remove(file_path)
 
 
+
+def mock_db_execute_update(files: List[FileCallbackItem]):
+    """使用 PyMySQL 执行实际的数据库写入和更新操作"""
+    if not files:
+        return
+
+    insert_card_data   = []
+    update_status_data = []
+
+    for file in files:
+        file_id = int(file.id)
+        user_id = int(file.user_id)
+
+        card_name = "安神抗癫方联合西药治疗癫痫中血清 SOD 水平回升幅度作为氧自由基清除达标及减药"
+
+        insert_card_data.append((file_id, card_name, user_id))
+        update_status_data.append((file_id,))
+
+    conn   = None
+    cursor = None
+    name_repeat = 0
+    try:
+        conn   = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        insert_sql = """
+            INSERT INTO evidence_file_card_name (file_id, card_name, user_id, name_repeat, status)
+            VALUES (%s, %s, %s, %s)
+        """
+        cursor.executemany(insert_sql, insert_card_data)
+        print(f"[DB LOG] 成功插入 {cursor.rowcount} 条记录到 evidence_file_card_name")
+
+        # # 批量更新 evidence_file_info 表的状态
+        # update_sql = """
+        #     UPDATE evidence_file_info
+        #     SET file_status = 1
+        #     WHERE id = %s
+        # """
+        # cursor.executemany(update_sql, update_status_data)
+        # print(f"[DB LOG] 成功更新 {cursor.rowcount} 条记录的 file_status")
+
+        conn.commit()
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"[DB ERROR] 数据库操作失败，已回滚: {e}")
+        raise e
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+# ================= 🌟 新增：手动触发生成卡片的请求模型 =================
+class GenerateTitlesRequest(BaseModel):
+    file_id: int = Field(..., description="要生成卡片的文件ID")
+    user_id: int = Field(..., description="所属用户ID")
+
+
+# ================= 🌟 新增：从向量库查询并生成卡片的后台任务 =================
+async def background_generate_titles(file_id: int, user_id: int):
+    """
+    根据 file_id 查向量库，并调用卡片生成逻辑
+    """
+    try:
+        print(f"[手动触发] 开始为文件ID {file_id} 查库并生成卡片标题...")
+
+        # 1. 查 Milvus 库 (提取对应的 text 和 vector)
+        # 注意：这里假设你在 Milvus 中的 file_id 字段类型是整型 (Int64)
+        results = milvus_client.query(
+            collection_name=MILVUS_COLLECTION_MAIN,
+            filter=f"file_id == {file_id}",
+            output_fields=["text", "vector"]
+        )
+
+        if not results:
+            print(f"[手动触发] 文件ID {file_id} 在向量库中未找到任何切片数据！(可能是文件未解析成功或已被删除)")
+            return
+
+        embeddings_list = []
+        texts = []
+        metadata = []
+
+        # 2. 组装数据供大模型提炼使用
+        for item in results:
+            if "vector" in item and "text" in item:
+                embeddings_list.append(item["vector"])
+                texts.append(item["text"])
+                metadata.append(f"来源文件ID: {file_id}")
+
+        if not embeddings_list:
+            print(f"[手动触发] 文件ID {file_id} 没有有效的向量数据！")
+            return
+
+        print(f"[手动触发] 查找到 {len(texts)} 个分块，开始智能提炼卡片...")
+
+        # 3. 调用核心生成逻辑
+        await mine_card_titles_for_file(file_id, user_id, embeddings_list, texts, metadata)
+
+        print(f"[手动触发] 文件ID {file_id} 卡片标题提炼全部完成！")
+
+    except Exception as e:
+        print(f"[手动触发] 文件ID {file_id} 生成卡片标题异常: {e}")
+
+
+
 # ================= 接口一：OSS URL 批量提交解析入库 =================
-@app.post("/api/v1/upload_batch")
+@app.post("/api/v1/analysis_file")
 async def create_upload_batch_from_url(
     background_tasks: BackgroundTasks,
     files: List[FileCallbackItem]
@@ -779,13 +983,20 @@ async def create_upload_batch_from_url(
         download_path = os.path.join(UPLOAD_DIR, f"{task_id}{ext}")
         final_path    = download_path
 
-        # ── 步骤 1：从 OSS 下载文件 ──
+        # ── 步骤 1：从 OSS 异步下载文件（🌟 修复阻塞问题） ──
         try:
-            resp = requests.get(file_url, timeout=60)
-            resp.raise_for_status()
-            with open(download_path, 'wb') as fp:
-                fp.write(resp.content)
+            # 使用 asyncio.to_thread 或 run_in_executor 将同步下载放入独立线程，不阻塞主线程
+            loop = asyncio.get_running_loop()
+
+            def download_file_sync(url, path):
+                response = requests.get(url, timeout=600)  # 给大文件长一点的超时时间
+                response.raise_for_status()
+                with open(path, 'wb') as f:
+                    f.write(response.content)
+
+            await loop.run_in_executor(None, download_file_sync, file_url, download_path)
             print(f"[下载成功] {file_name}  ->  {download_path}")
+
         except Exception as e:
             raise HTTPException(
                 status_code=500,
@@ -846,85 +1057,59 @@ async def create_upload_batch_from_url(
     })
 
 
-# ================= 接口二：文件处理完成回调（原有接口，保持不变） =================
-@app.post("/api/v1/analysis_file", status_code=200)
-async def update_file_status(files: List[FileCallbackItem]):
+
+# # ================= 接口二：文件处理完成回调（原有接口，保持不变） =================
+# @app.post("/api/v1/analysis_file", status_code=200)
+# async def update_file_status(files: List[FileCallbackItem]):
+#     """
+#     接收文件处理完成的回调，更新数据库状态
+#     """
+#     if not files:
+#         raise HTTPException(status_code=400, detail="请求数据不能为空")
+#
+#     valid_ids = []
+#     for file in files:
+#         try:
+#             valid_ids.append(file.id)
+#         except ValueError:
+#             raise HTTPException(status_code=400, detail=f"文件 ID [{file.id}] 格式错误，无法转换为数字")
+#
+#     if not valid_ids:
+#         return {"code": 200, "message": "没有需要更新的数据"}
+#
+#     try:
+#         mock_db_execute_update(files)
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"数据库更新失败: {str(e)}")
+#
+#     return {"code": 200, "message": "success"}
+
+
+
+# ================= 🌟 新增接口三：根据 file_id 单独生成卡片标题 =================
+@app.post("/api/v1/generate_titles")
+async def generate_titles_endpoint(
+        req: GenerateTitlesRequest,
+        background_tasks: BackgroundTasks
+):
     """
-    接收文件处理完成的回调，更新数据库状态
+    提供给前端/业务端的独立接口：
+    传入 file_id 和 user_id，系统会从 Milvus 中提取该文件的数据，并生成 10 个卡片标题入库。
     """
-    if not files:
-        raise HTTPException(status_code=400, detail="请求数据不能为空")
+    if req.file_id <= 0:
+        raise HTTPException(status_code=400, detail="非法的 file_id")
 
-    valid_ids = []
-    for file in files:
-        try:
-            valid_ids.append(file.id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"文件 ID [{file.id}] 格式错误，无法转换为数字")
+    # 加入后台异步任务，避免 HTTP 请求超时
+    background_tasks.add_task(
+        background_generate_titles,
+        req.file_id,
+        req.user_id
+    )
 
-    if not valid_ids:
-        return {"code": 200, "message": "没有需要更新的数据"}
-
-    try:
-        mock_db_execute_update(files)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"数据库更新失败: {str(e)}")
-
-    return {"code": 200, "message": "success"}
-
-
-def mock_db_execute_update(files: List[FileCallbackItem]):
-    """使用 PyMySQL 执行实际的数据库写入和更新操作"""
-    if not files:
-        return
-
-    insert_card_data   = []
-    update_status_data = []
-
-    for file in files:
-        file_id = int(file.id)
-        user_id = int(file.user_id)
-
-        card_name = "安神抗癫方联合西药治疗癫痫中血清 SOD 水平回升幅度作为氧自由基清除达标及减药"
-
-        insert_card_data.append((file_id, card_name, user_id))
-        update_status_data.append((file_id,))
-
-    conn   = None
-    cursor = None
-    try:
-        conn   = pymysql.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-
-        insert_sql = """
-            INSERT INTO evidence_file_card_name (file_id, card_name, user_id)
-            VALUES (%s, %s, %s)
-        """
-        cursor.executemany(insert_sql, insert_card_data)
-        print(f"[DB LOG] 成功插入 {cursor.rowcount} 条记录到 evidence_file_card_name")
-
-        # # 批量更新 evidence_file_info 表的状态
-        # update_sql = """
-        #     UPDATE evidence_file_info
-        #     SET file_status = 1
-        #     WHERE id = %s
-        # """
-        # cursor.executemany(update_sql, update_status_data)
-        # print(f"[DB LOG] 成功更新 {cursor.rowcount} 条记录的 file_status")
-
-        conn.commit()
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"[DB ERROR] 数据库操作失败，已回滚: {e}")
-        raise e
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+    return JSONResponse(content={
+        "code": 200,
+        "msg": f"已成功将文件ID [{req.file_id}] 的卡片生成任务加入后台队列，稍后可在数据库查看生成结果"
+    })
 
 
 if __name__ == "__main__":

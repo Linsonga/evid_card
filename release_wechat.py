@@ -267,37 +267,24 @@ async def run_wechat_mcp_example(articles):
     return publish_results
 
 
+def wechat_indent_formatter(match):
+    # 捕获组 1：获取列表符号前面的空格
+    leading_spaces = match.group(1)
 
+    # 情况 1：如果没有空格，说明是一级列表（如：研究类型、1. 动态监测）
+    # 直接去掉符号，并加上换行符隔离段落
+    if not leading_spaces:
+        return '\n'
 
-# def clean_markdown_for_wechat(text: str) -> str:
-#     """
-#     专门为微信公众号清洗 Markdown 格式的公共方法
-#     """
-#     if not text:
-#         return ""
-#
-#     # 1. 去掉第一行的一级标题 (# 标题)
-#     text = re.sub(r'^#\s+.*(?:\r?\n|$)', '', text, count=1)
-#
-#     # text = re.sub(r'\*', '', text)
-#     #
-#     # # 2. 处理加粗：把 **文字** 变成 文字
-#     # text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-#     #
-#     # # 3. 处理列表符号：
-#     # # 匹配行首的 * 或 - ，后面跟着空格的情况，直接去掉符号保留文字
-#     # # 使用 MULTILINE 模式确保处理每一行
-#     # text = re.sub(r'^\s*[\*\-]\s+', '', text, flags=re.MULTILINE)
-#     #
-#     # # 去多余符号
-#     # text = re.sub(r'[ \t]+$', '', text, flags=re.MULTILINE)
-#     #
-#     # # 4. 处理嵌套导致的残留星号：
-#     # # 有时加粗和列表连用会剩下孤立的 *，或者是处理后多出的空格
-#     # text = re.sub(r'^\s*\*\s*', '', text, flags=re.MULTILINE)
-#
-#     return text.strip()
+    # 情况 2：如果有空格，说明是子列表（如：血清 SOD、脑电图）
+    # Markdown 默认用 4 个普通空格表示一层缩进
+    # 我们将其转换为 2 个“中文全角空格”（注意：不要改成普通空格），微信绝对无法吃掉全角空格
+    # len(leading_spaces) // 2 意味着：4个普通空格 -> 2个全角空格
+    # full_width_spaces = '  ·' * (len(leading_spaces) // 1)
+    full_width_spaces = '·'
 
+    # 返回换行符 + 强制全角空格缩进
+    return '\n' + full_width_spaces
 
 
 def clean_markdown_for_wechat(md_text: str) -> str:
@@ -308,65 +295,40 @@ def clean_markdown_for_wechat(md_text: str) -> str:
     if not md_text:
         return ""
 
-    # 0. 清理网页复制带来的不可见字符
-    md_text = md_text.replace('\xa0', ' ')
 
-    # ==========================================
-    # 1. 修复【一级数字列表】
-    # 将 \s 替换为 [ \t]，绝对不吞换行符
-    # ==========================================
-    pattern_num = r'^([ \t]*\d+\.[ \t]*)\*\*(.*?)\*\*(?:：|:)?[ \t]*'
-    md_text = re.sub(pattern_num, r'\1【\2】：', md_text, flags=re.MULTILINE)
+    # # 假设原始文本在 text 变量中
+    # # 将替换目标从 '' (空) 改为 '\n' (换行符)
+    # md_text = re.sub(r'^\s*\d+\.\s+', '\n', md_text, flags=re.MULTILINE)
+    #
+    # # 如果您也想处理无序列表（* 或 -），同样替换为 '\n'
+    # md_text = re.sub(r'^\s*[\*\-]\s+', '\n', md_text, flags=re.MULTILINE)
 
-    # ==========================================
-    # 2. 修复【嵌套的无序列表+加粗标题】
-    # 使用 \n\n 强制切断原有的段落，生成新段落
-    # 使用 \u3000\u3000（两个全角空格）占位实现缩进
-    # ==========================================
-    pattern_bullet_bold = r'^[ \t]{1,}[\*\-][ \t]+\*\*(.*?)\*\*(?:：|:)?[ \t]*'
-    md_text = re.sub(pattern_bullet_bold, '\n\n\t\t【\\1】：', md_text, flags=re.MULTILINE)
+    md_text = re.sub(r'^(\s*)(?:\d+\.|[\*\-])\s+', wechat_indent_formatter, md_text, flags=re.MULTILINE)
 
-    # ==========================================
-    # 3. 兜底修复【普通嵌套无序列表】
-    # 同样使用双换行 \n\n 强制生成新段落
-    # ==========================================
-    pattern_bullet_normal = r'^[ \t]{1,}[\*\-][ \t]+'
-    md_text = re.sub(pattern_bullet_normal, '\n\n\t\t', md_text, flags=re.MULTILINE)
+
+    # # 0. 清理网页复制带来的不可见字符
+    # md_text = md_text.replace('\xa0', ' ')
+    #
+    # # ==========================================
+    # # 1. 修复【一级数字列表】
+    # # 将 \s 替换为 [ \t]，绝对不吞换行符
+    # # ==========================================
+    # pattern_num = r'^([ \t]*\d+\.[ \t]*)\*\*(.*?)\*\*(?:：|:)?[ \t]*'
+    # md_text = re.sub(pattern_num, r'\1【\2】：', md_text, flags=re.MULTILINE)
+    #
+    # # ==========================================
+    # # 2. 修复【嵌套的无序列表+加粗标题】（解决必要条件和辅助条件挤在一行）
+    # # ==========================================
+    # pattern_bullet_bold = r'^[ \t]{1,}[\*\-][ \t]+\*\*(.*?)\*\*(?:：|:)?[ \t]*'
+    # md_text = re.sub(pattern_bullet_bold, r'  ▶ 【\1】：', md_text, flags=re.MULTILINE)
+    #
+    # # ==========================================
+    # # 3. 兜底修复【普通嵌套无序列表】
+    # # ==========================================
+    # pattern_bullet_normal = r'^[ \t]{1,}[\*\-][ \t]+'
+    # md_text = re.sub(pattern_bullet_normal, r'  ▶ ', md_text, flags=re.MULTILINE)
 
     return md_text
-
-
-# def clean_markdown_for_wechat(md_text: str) -> str:
-#     """
-#     终极微信排版清洗函数（防吞换行版）：
-#     强行拍平所有 Markdown 列表和加粗标识，转换为最普通的纯文本符号排版。
-#     """
-#     if not md_text:
-#         return ""
-#
-#     # 0. 清理网页复制带来的不可见字符
-#     md_text = md_text.replace('\xa0', ' ')
-#
-#     # ==========================================
-#     # 1. 修复【一级数字列表】
-#     # 将 \s 替换为 [ \t]，绝对不吞换行符
-#     # ==========================================
-#     pattern_num = r'^([ \t]*\d+\.[ \t]*)\*\*(.*?)\*\*(?:：|:)?[ \t]*'
-#     md_text = re.sub(pattern_num, r'\1【\2】：', md_text, flags=re.MULTILINE)
-#
-#     # ==========================================
-#     # 2. 修复【嵌套的无序列表+加粗标题】（解决必要条件和辅助条件挤在一行）
-#     # ==========================================
-#     pattern_bullet_bold = r'^[ \t]{1,}[\*\-][ \t]+\*\*(.*?)\*\*(?:：|:)?[ \t]*'
-#     md_text = re.sub(pattern_bullet_bold, r'  ▶ 【\1】：', md_text, flags=re.MULTILINE)
-#
-#     # ==========================================
-#     # 3. 兜底修复【普通嵌套无序列表】
-#     # ==========================================
-#     pattern_bullet_normal = r'^[ \t]{1,}[\*\-][ \t]+'
-#     md_text = re.sub(pattern_bullet_normal, r'  ▶ ', md_text, flags=re.MULTILINE)
-#
-#     return md_text
 
 
 
@@ -377,8 +339,8 @@ def main():
     # --- 配置项 ---
     md_dir = "card_md"
     test_mode = True  # 设置为 True 则只选取较少数量测试
-    batch_size = 2
-    draft_mode = True  # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
+    batch_size = 6
+    draft_mode = False  # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
     # --------------
 
     if not os.path.exists(md_dir):
@@ -414,11 +376,11 @@ def main():
     #     print("未匹配到实时热点文章。")
     #     if test_mode:
     #         print("测试模式：强制选取第一个待发布文件进行测试。")
-    #         seasonal_files = [unpublished_files[0]]
+    #         seasonal_files = unpublished_files[:batch_size]
     #     else:
     #         return
 
-    seasonal_files = [unpublished_files[0]]
+    seasonal_files = unpublished_files[:batch_size]
     # 4. 构建待发布的 articles 列表数据
     articles_to_publish = []
 
@@ -443,29 +405,6 @@ def main():
             # 调用公共方法
             content = clean_markdown_for_wechat(content)
             content = re.sub(r'^#\s+.*(?:\r?\n|$)', '', content, count=1).strip()
-
-            # 使用
-            # md_text = "# 测试文章\n这是一篇自动生成的文章。"
-            # content = md_to_wechat_html(content)
-
-            # content = fix_wechat_markdown(content)
-            # 转换为带微信自适应样式的 HTML
-            # content = markdown_css.convert(content, style='github')
-            # res = convert_markdown_to_wechat(content)
-            # content = res.data['html']
-
-
-
-            # # 1. 去掉第一行的一级标题 (# 标题内容)
-            # # ^#\s+.*(?:\r?\n|$): 匹配以 # 开头，后面跟着空格和任意字符，直到换行符或文件末尾
-            # content = re.sub(r'^#\s+.*(?:\r?\n|$)', '', content, count=1).strip()
-            #
-            # # 微信公众号排版清理（如需）
-            # # 处理加粗符号导致的多余星号问题 (去除文本中的 **)
-            # content = re.sub(r'\*\*(.*?)\*\*', r'\1', content)
-
-
-
 
             print(f"正在为生成 AI 封面...")
             cover_abs_path = generate_ai_cover_dashscope_api(title=title)
@@ -508,7 +447,7 @@ def main():
             platform='wechat',
             filename=res['rel_path'],
             status=res['status'],
-            message=res['msg']
+            note=res['msg']
         )
         if res['status'] == 'success':
             success_count += 1

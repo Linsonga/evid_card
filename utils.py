@@ -4,7 +4,9 @@ import json
 import urllib3
 import requests
 import threading
-
+import base64      # 🌟 新增：用于图片 Base64 编码
+import asyncio     # 🌟 新增：用于异步事件循环处理
+import random
 from logger import logger
 from filelock import FileLock
 from datetime import datetime
@@ -90,12 +92,81 @@ async def request_qwen_async(system_prompt, user_prompt):
     return completion.choices[0].message.content
 
 
+# ================= 🌟 新增图片 OCR 识别方法 =================
+async def extract_text_from_image(file_path: str) -> str:
+    """调用通义千问视觉模型(qwen-vl-ocr)识别本地图片中的文本"""
+    loop = asyncio.get_running_loop()
+
+    def sync_ocr():
+        # 获取后缀以决定 mime type
+        ext = os.path.splitext(file_path)[-1].lower().replace('.', '')
+        mime_type = "jpeg" if ext == "jpg" else ext
+
+        # 将本地图片读取并转换为 Base64 格式
+        with open(file_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+        data_uri = f"data:image/{mime_type};base64,{base64_image}"
+
+        client = AsyncOpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+
+        completion = client.chat.completions.create(
+            model="qwen-vl-ocr-2025-11-20",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_uri
+                            },
+                        },
+                        {"type": "text", "text": "请仅输出图像中的文本内容。"},
+                    ],
+                },
+            ],
+        )
+        return completion.choices[0].message.content
+
+    # 放入线程池执行，防止阻塞主线程
+    return await loop.run_in_executor(None, sync_ocr)
+
 
 
 def generate_ai_cover_dashscope_api(title, output_dir="images/covers"):
     """
     按照 DashScope 官方 REST API 示例修改的生图函数
     """
+    # 10种围绕“专业极简扁平”的微调风格库
+    style_pool = [
+        # 1. 经典标准
+        "风格：纯粹扁平插画 + 极简主义。无多余装饰。配色：明亮柔和（医疗蓝/薄荷绿/纯白）。背景：极浅的低饱和度冰蓝色或雾灰色。",
+
+        # 3. 矢量细线描边
+        "风格：矢量扁平。主体保留纯色填色，外边缘带有干净的单色极细轮廓线。配色：经典白蓝搭配，辅以浅灰。背景：柔和的高级燕麦色或米灰色。",
+
+        # 4. 几何规则化
+        "风格：几何化扁平插画。使用极度规则的几何图形去高度概括人体或医疗元素。配色：克制的低饱和冷色调（灰蓝、青绿）。背景：低饱和度的冷灰蓝色调。",
+
+        # 6. 图层半透叠加
+        "风格：扁平图层叠加风。利用半透明的纯色块交叠来展现器官或元素的内部逻辑关系。配色：清透的浅水蓝、浅草绿交叠。背景：极浅的紫灰色或丁香灰。",
+
+        # 7. 暖意点缀极简
+        "风格：扁平极简 + 极少暖意点缀。在经典的蓝绿冷色调主导下，加入极少量的一个暖色作为视觉焦点。配色：蓝绿为主，微暖色辅助。背景：温暖治愈的奶白色或极浅的珍珠粉色。",
+
+        # 8. 信息图表风
+        "风格：现代医疗信息图扁平风。类似高端体检报告或《柳叶刀》等医学期刊中的极简配图。配色：高明度、低饱和度的科技蓝与灰。背景：专业的低饱和度磨砂灰，或带有极浅的水印网格底色 (Light matte gray)。",
+
+        # 9. 负空间剪影
+        "风格：正负形极简插画。巧妙利用背景的底色空间来反向勾勒出主体的轮廓。配色：极致精简的双色块。背景：低饱和度的灰青色或浅石板灰。",
+
+        # 10. 临床硬朗切面
+        "风格：硬朗极简扁平风。边缘相对锐利，减少圆角过渡，强调果断的切面感和精确度。配色：极其干净的医用白、深灰与亮蓝。背景：无菌感的极浅冷青色或工业浅灰。"
+    ]
+    # 随机抽取一种风格
+    selected_style = random.choice(style_pool)
+
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
@@ -108,30 +179,27 @@ def generate_ai_cover_dashscope_api(title, output_dir="images/covers"):
         "Authorization": f"Bearer {api_key}"
     }
 
-    # 2. 构造提示词
-    prompt = f"""你是一名医学科普插画设计师。
+    # 2. 构造提示词1
+    prompt = f"""你是一名医学科普插画设计师。根据给定主题生成一张封面插画描述（用于AI绘图）。
+    【输入主题】：{title}
 
-根据给定主题生成一张封面插画描述（用于AI绘图）。
+   【通用核心要求】
+    1.提取 1-2 个最核心医学关键词作为视觉线索。
+    2.设置2个视觉元素，元素之间需有自然的连接或过渡。
+    3.【宽屏构图要求】：
+    - 元素尺寸：核心医学视觉元素必须设定为【小巧、精致】（仅占画面5%的比例），拒绝庞大臃肿。
+    - 空间排布：严禁将所有元素缩在正中间。请采用左右呼应、黄金分割或对角线构图，将小尺寸元素有节奏地分散。
+    4. 图片文字：
+       - 仅保留一个核心医学关键词（位置可偏左中或偏右中或中间排列以平衡构图）
+       - 严禁长句
 
-【输入主题】
-{title}
-
-【要求】
-1. 仅提取 2–3 个最核心医学关键词（不要超过3个）
-2. 每个关键词只对应一个简单视觉元素（避免复杂组合）
-3. 画面只保留一个中心主体，其余为极少量辅助元素
-4. 风格必须：扁平插画 + 极简主义 + 医学科普风
-5. 配色：明亮柔和（蓝 / 绿 / 白），避免多色混乱
-6. 背景：干净留白，不添加复杂细节
-7. 图片文字：
-   - 仅保留一个主标题（通俗表达）
-   - 可选一个简短副标题（1个关键词即可）
-   - 严禁长句
-"""
+    【本张插画的专属视觉设定】
+    {selected_style}
+    """
 
     # 3. 构造请求体 (完全参考你的 cURL 示例)
     payload = {
-        "model": "wan2.7-image-pro",  # 使用示例中的新模型
+        "model": "wan2.7-image",  # 使用示例中的新模型
         "input": {
             "messages": [
                 {
@@ -146,7 +214,7 @@ def generate_ai_cover_dashscope_api(title, output_dir="images/covers"):
             "size": "1280*720",  # 也可以根据需求设为 "2K"
             "n": 1,
             "watermark": False,
-            "thinking_mode": True  # 开启思考模式，生成质量更高
+            "thinking_mode": False  # 开启思考模式，生成质量更高
         }
     }
 
@@ -172,15 +240,24 @@ def generate_ai_cover_dashscope_api(title, output_dir="images/covers"):
                 print(f"⚠️ 未获取到图片 URL: {result}")
                 return None
 
-            # 6. 下载并保存
+            # 6. 下载并保存（转 JPG 压缩，控制在 1M 以内）
+            from PIL import Image
+            import io
             img_data = requests.get(image_url).content
             safe_title = "".join(c for c in title if c.isalnum())[:20]
-            # timestamp = int(datetime.now().timestamp())
-            file_name = f"{safe_title}.png"
+            file_name = f"{safe_title}.jpg"
             file_path = os.path.join(output_dir, file_name)
 
+            img = Image.open(io.BytesIO(img_data)).convert("RGB")
+            quality = 85
+            while quality >= 20:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality)
+                if buf.tell() <= 1 * 1024 * 1024:
+                    break
+                quality -= 10
             with open(file_path, "wb") as f:
-                f.write(img_data)
+                f.write(buf.getvalue())
 
             return os.path.abspath(file_path)
         else:
@@ -286,7 +363,7 @@ VECTOR_CACHE_LOCK = f"{VECTOR_CACHE_FILE}.lock"
 
 # 全局内存缓存，仅在启动时或第一次调用时加载一次
 _global_vector_cache = None
-_vector_memory_lock = threading.Lock() # 🌟 新增：内存级别的锁
+_vector_memory_lock = threading.Lock() #新增：内存级别的锁
 
 def load_vector_cache():
     """将 JSONL 文件一次性加载到内存字典中"""
@@ -319,7 +396,7 @@ def get_cached_vector(title):
     if title in cache:
         return cache[title]
 
-    # 2. 🌟 修改：未命中时加锁，并进行二次检查
+    # 2.修改：未命中时加锁，并进行二次检查
     with _vector_memory_lock:
         # 双重检查：防止在等待锁的期间，别的线程已经把这个 title 请求回来并存入 cache 了
         if title in cache:
