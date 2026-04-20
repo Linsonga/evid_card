@@ -174,13 +174,26 @@ def insert_file_card_names(file_id: int, user_id: int, card_names: list):
         conn = pymysql.connect(**DB_CONFIG)
         cursor = conn.cursor()
 
+        # 1. 生成当前时间戳
+        # int(time.time()) 生成的是 10 位数的秒级时间戳。
+        # 如果你的 bigint 字段设计用来存储 13 位数的毫秒级时间戳，请改为：int(time.time() * 1000)
+        # current_time = int(time.time())
+        current_time = int(time.time() * 1000)
+
         sql = """
-            INSERT INTO evidence_file_card_name (file_id, card_name, name_info, user_id, status, name_repeat)
-            VALUES (%s, %s, %s, %s, 0, %s)
+            INSERT INTO evidence_file_card_name (file_id, card_name, name_info, user_id, status, name_repeat, status_time)
+            VALUES (%s, %s, %s, %s, 0, %s, %s)
         """
         # 修改：元组中增加 item.get("name_repeat", 0)
         insert_data = [
-            (file_id, item["title"], item["reason"], user_id, item.get("name_repeat", 0))
+            (
+                file_id,
+                item["title"],
+                item["reason"],
+                user_id,
+                item.get("name_repeat", 0),
+                current_time
+            )
             for item in card_names
         ]
 
@@ -402,7 +415,7 @@ def convert_docx_to_pdf_sync(docx_path: str, output_dir: str):
 
 
 
-def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str = None, type: str = 'pdf', user_id: str = '', file_name: str = ''):
+def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str = None, type: str = 'pdf', user_id: str = '', file_id: int = 0):
     """
     遍历分块数据，调用 Embedding 接口，批量写入 Milvus。
     batch_id:  同一批次的多个文件共用同一个 batch_id；不传则默认使用 task_id。
@@ -840,20 +853,23 @@ def mock_db_execute_update(files: List[FileCallbackItem]):
         user_id = int(file.user_id)
 
         card_name = "安神抗癫方联合西药治疗癫痫中血清 SOD 水平回升幅度作为氧自由基清除达标及减药"
-
-        insert_card_data.append((file_id, card_name, user_id))
+        name_repeat = 0
+        status = 1
+        name_info = "描述xxxxxx"
+        status_time = 1776594104631
+        insert_card_data.append((file_id, card_name, user_id, name_repeat, status, name_info, status_time))
         update_status_data.append((file_id,))
 
     conn   = None
     cursor = None
-    name_repeat = 0
+
     try:
         conn   = pymysql.connect(**DB_CONFIG)
         cursor = conn.cursor()
 
         insert_sql = """
-            INSERT INTO evidence_file_card_name (file_id, card_name, user_id, name_repeat, status)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO evidence_file_card_name (file_id, card_name, user_id, name_repeat, status, name_info, status_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         cursor.executemany(insert_sql, insert_card_data)
         print(f"[DB LOG] 成功插入 {cursor.rowcount} 条记录到 evidence_file_card_name")
@@ -1058,31 +1074,31 @@ async def create_upload_batch_from_url(
 
 
 
-# # ================= 接口二：文件处理完成回调（原有接口，保持不变） =================
-# @app.post("/api/v1/analysis_file", status_code=200)
-# async def update_file_status(files: List[FileCallbackItem]):
-#     """
-#     接收文件处理完成的回调，更新数据库状态
-#     """
-#     if not files:
-#         raise HTTPException(status_code=400, detail="请求数据不能为空")
-#
-#     valid_ids = []
-#     for file in files:
-#         try:
-#             valid_ids.append(file.id)
-#         except ValueError:
-#             raise HTTPException(status_code=400, detail=f"文件 ID [{file.id}] 格式错误，无法转换为数字")
-#
-#     if not valid_ids:
-#         return {"code": 200, "message": "没有需要更新的数据"}
-#
-#     try:
-#         mock_db_execute_update(files)
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"数据库更新失败: {str(e)}")
-#
-#     return {"code": 200, "message": "success"}
+# ================= 接口二：文件处理完成回调（原有接口，保持不变） =================
+@app.post("/api/v1/analysis_file2", status_code=200)
+async def update_file_status(files: List[FileCallbackItem]):
+    """
+    接收文件处理完成的回调，更新数据库状态
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="请求数据不能为空")
+
+    valid_ids = []
+    for file in files:
+        try:
+            valid_ids.append(file.id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"文件 ID [{file.id}] 格式错误，无法转换为数字")
+
+    if not valid_ids:
+        return {"code": 200, "message": "没有需要更新的数据"}
+
+    try:
+        mock_db_execute_update(files)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"数据库更新失败: {str(e)}")
+
+    return {"code": 200, "message": "success"}
 
 
 

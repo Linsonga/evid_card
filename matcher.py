@@ -118,7 +118,7 @@ class QwenEmbeddingMatcher:
         conn = get_db_connection()
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         try:
-            cursor.execute("SELECT title FROM evidence_card WHERE topic_id = %s", (topic_id,))
+            cursor.execute("SELECT title FROM evidence_card WHERE id > 1192723 and topic_id = %s", (topic_id,))
             results = cursor.fetchall()
         finally:
             # 🌟 修改点：确保归还连接
