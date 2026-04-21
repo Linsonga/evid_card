@@ -312,6 +312,23 @@ def extract_xmind_to_text(pdf_path):
     return json.dumps(nodes, ensure_ascii=False)
 
 
+def convert_doc_to_docx_sync(doc_path: str, output_dir: str):
+    """调用系统 LibreOffice 将旧版 .doc 转换为 .docx"""
+    command = [
+        "soffice",
+        "--headless",
+        "--convert-to", "docx",
+        doc_path,
+        "--outdir", output_dir
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    except subprocess.CalledProcessError as e:
+        raise Exception(f"DOC 转 DOCX 失败: {e.stderr.decode('utf-8', errors='ignore')}")
+    except FileNotFoundError:
+        raise Exception("找不到 soffice 命令，请确保服务器安装了 LibreOffice")
+
+
 def extract_text_from_pdf_with_plumber(pdf_path: str) -> list:
     """
     使用 pdfplumber 逐页提取 PDF 文本
@@ -432,7 +449,6 @@ def chunk_text_data(content_list, split_to_length: int = 200):
         item_type = con.get("type")
 
         # 🌟 核心改进 2：强制将传入的文本（即使是几千字的整块）按标点打碎成句子列表
-        # 例如："你好。世界！" 会被 split 成 ["你好", "。", "世界", "！", ""]
         pieces = re.split(sentence_pattern, t)
         sentences = []
 
@@ -450,8 +466,6 @@ def chunk_text_data(content_list, split_to_length: int = 200):
 
         # 🌟 核心改进 3：遍历打碎后的短句，根据长度上限(split_to_length)重新组装
         for sentence in sentences:
-            # 判断：如果当前积累的长度 + 新句子的长度 > 目标长度，且当前积累器里有东西
-            # （例外：如果上一个是 title，则强行跟下一段连着，不截断）
             if (len(current_text) + len(sentence) > split_to_length) and len(current_text) > 0 and last_type != "title":
                 # 保存上一个块
                 new_block_list.append({
@@ -479,8 +493,6 @@ def chunk_text_data(content_list, split_to_length: int = 200):
         })
 
     # 5. 结尾小块并入前一块的逻辑优化
-    # 为了防止把一个本来 180 字的块和 150 字的块合并成 330 字（超标）
-    # 我们只将非常短的尾巴（例如小于目标长度的 1/3）合并到上一块
     min_tail_length = split_to_length // 3
     if len(new_block_list) >= 2 and len(new_block_list[-1]["text"]) < min_tail_length:
         new_block_list[-2]["text"] += new_block_list[-1]["text"]
@@ -490,10 +502,14 @@ def chunk_text_data(content_list, split_to_length: int = 200):
     # 6. 构造最终返回的数据格式
     final_res_list = []
     for index, block in enumerate(new_block_list):
+        # 🌟 新增：在这里统一把文本中的 \n 清除掉
+        # 使用 replace('\n', '') 去除换行符，如果是中英文混排怕粘连，也可以换成 replace('\n', ' ')
+        clean_text = block["text"].replace('\n', '').strip()
+
         final_res_list.append({
-            "text": block["text"].strip(),
+            "text": clean_text,
             "index": index,
-            "length": len(block["text"].strip()),
+            "length": len(clean_text),  # 长度也基于清洗后的计算
             "bbox": block["bbox"]
         })
 
@@ -819,7 +835,8 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
     try:
         ext = os.path.splitext(file_path)[-1].lower()
         print()
-        print(f"文件类型是：{ext}")
+        print(f"识别文件类型是：{ext}")
+
         # ===== 分支一：TXT 文件 =====
         if ext == '.txt':
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -832,6 +849,73 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 task_id, chunked_data, batch_id=batch_id, type='txt',
                 user_id=user_id, file_id=file_id
             )
+
+        # 🌟 ===== 新增分支：DOCX 文件直接读取 =====
+        elif ext in ['.docx', '.doc']:
+            print(f"[批次 {batch_id}] 任务 {task_id} 检测到 Word 类型({ext})，开始提取纯文本...")
+            try:
+                from docx import Document
+
+                process_path = file_path
+
+                # 如果是旧版 .doc，先利用 LibreOffice 极速转成 .docx
+                if ext == '.doc':
+                    print(f"正在将 .doc 转换为 .docx: {file_path}")
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, convert_doc_to_docx_sync, file_path, UPLOAD_DIR)
+                    # 拼接转换后的新路径 (例如 xxx.doc 转换后会在同目录生成 xxx.docx)
+                    base_name = os.path.basename(file_path)
+                    name_without_ext = os.path.splitext(base_name)[0]
+                    process_path = os.path.join(UPLOAD_DIR, name_without_ext + ".docx")
+
+                # 读取 docx 文件（原生 docx，或刚转换出来的 docx）
+                doc = Document(process_path)
+                text_content_list = []
+
+                # 1. 提取所有普通段落文本
+                for para in doc.paragraphs:
+                    text = para.text.strip()
+                    if text:
+                        text_content_list.append(text)
+
+                # 2. 提取所有表格中的文本（按行拼接）
+                for table in doc.tables:
+                    for row in table.rows:
+                        row_data = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                        if row_data:
+                            text_content_list.append(" | ".join(row_data))
+
+                full_docx_text = "\n".join(text_content_list)
+
+                if not full_docx_text.strip():
+                    raise Exception("Word 文件中未提取到有效文字内容")
+
+                detected_lang = is_chinese_or_english(full_docx_text)
+
+                # 3. 组装分块
+                chunked_data = chunk_text_data(
+                    [{"type": "text", "text": full_docx_text}], split_to_length=200
+                )
+                print("识别doc文件内容")
+                print(chunked_data)
+                print()
+                # 4. 入库
+                db_result = process_and_insert_to_milvus(
+                    task_id, chunked_data, batch_id=batch_id, type='word',
+                    user_id=user_id, file_id=file_id
+                )
+
+                # 5. 清理临时生成的 .docx 文件，避免磁盘占用
+                if ext == '.doc' and os.path.exists(process_path):
+                    os.remove(process_path)
+
+            except ImportError:
+                raise Exception("缺少 python-docx 库，请在终端执行 pip install python-docx")
+            except Exception as e:
+                # 失败时也要确保清理临时文件
+                if ext == '.doc' and 'process_path' in locals() and os.path.exists(process_path):
+                    os.remove(process_path)
+                raise Exception(f"Word 解析失败: {str(e)}")
             # 🌟 ===== 分支三：Excel 文件 (新增) =====
         # elif ext in ['.xlsx', '.xls', '.csv']:
         #     print(f"[批次 {batch_id}] 任务 {task_id} 检测到表格类型({ext})，开始行列上下文绑定解析...")
@@ -1218,7 +1302,8 @@ async def download_convert_and_process(file_url: str, download_path: str, ext: s
         print(f"[后台下载成功] {file_name}  ->  {download_path}")
 
         # ── 2. 在后台执行 Office 转 PDF ──
-        if ext in ('.docx', '.doc', '.ppt', '.pptx'):
+        # if ext in ('.doc', '.ppt', '.pptx'):
+        if ext in ('.ppt', '.pptx'):
             final_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
             await loop.run_in_executor(None, convert_office_to_pdf_sync, download_path, UPLOAD_DIR)
             # 转换成功后删除源文件
@@ -1475,4 +1560,4 @@ async def generate_titles_endpoint(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(PORT), workers=1)
+    uvicorn.run(app, host="0.0.0.0", port=5911, workers=1)

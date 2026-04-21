@@ -172,7 +172,15 @@ class PDFParsing():
         if isinstance(image, str):
             image = cv2.imread(image)
         else:
-            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            arr = np.array(image)
+            if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
+                raise ValueError(f"传入 layout 的图像为空，shape={arr.shape}")
+            # 若已是 BGR numpy array（来自 pdf_parsing 的 [:,:,::-1] 转换），直接使用；
+            # 若是 PIL Image（RGB），则转换为 BGR
+            if isinstance(image, np.ndarray):
+                image = arr
+            else:
+                image = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
         results = self.layout_engine(image, conf=0.3, save_crop=False, verbose=False)
         labels = ['text', 'title', 'figure', 'figure_caption', 'table', 'table_caption', 'header', 'footer',
@@ -328,6 +336,11 @@ class PDFParsing():
             pix = None
             # --- 逐页渲染结束 ---
 
+            # 跳过空页（LibreOffice 转换的 PDF 偶尔会产生 0 尺寸页面）
+            if np_image.size == 0 or np_image.shape[0] == 0 or np_image.shape[1] == 0:
+                print(f"警告: 第 {page_id} 页渲染结果为空，已跳过。", flush=True)
+                continue
+
             # 使用当前生成的单页图片进行排版分析
             res_structure, image = self.layout(np_image)
 
@@ -352,11 +365,28 @@ class PDFParsing():
                         structure_lis = []
                         temp_lis = []
                     ### table rec
-                    if bbox[3]-bbox[1] > 1.5 * (bbox[2] - bbox[0]):
+                    # if bbox[3]-bbox[1] > 1.5 * (bbox[2] - bbox[0]):
+                    #     image_table = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+                    #     result_image = image_table[max(bbox[0]-5, 0):bbox[2]+3, -(bbox[3]+5):-max(bbox[1]-3, 0), ::-1]
+                    # else:
+                    #     result_image = image[max(bbox[1]-1, 0):bbox[3]+1, max(bbox[0]-5, 0):bbox[2]+3, ::-1]
+
+                    if bbox[3] - bbox[1] > 1.5 * (bbox[2] - bbox[0]):
                         image_table = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-                        result_image = image_table[max(bbox[0]-5, 0):bbox[2]+3, -(bbox[3]+5):-max(bbox[1]-3, 0), ::-1]
+                        # 获取旋转前原图的高度 (即现在的宽度)
+                        h_orig = image.shape[0]
+                        # 使用绝对正数索引替代负数索引
+                        col_start = max(0, h_orig - int(bbox[3]) - 5)
+                        col_end = h_orig - max(int(bbox[1]) - 3, 0)
+                        result_image = image_table[max(bbox[0] - 5, 0):bbox[2] + 3, col_start:col_end, ::-1]
                     else:
-                        result_image = image[max(bbox[1]-1, 0):bbox[3]+1, max(bbox[0]-5, 0):bbox[2]+3, ::-1]
+                        result_image = image[max(bbox[1] - 1, 0):bbox[3] + 1, max(bbox[0] - 5, 0):bbox[2] + 3, ::-1]
+
+                    # 🌟 新增容错拦截：如果因极端越界情况切图依然为空，跳过该区域，防止崩溃整批任务
+                    if result_image is None or result_image.size == 0:
+                        print(f"警告: 截取的图像区域为空，已跳过。bbox坐标: {bbox}", flush=True)
+                        continue
+
 
                     html_text = self.table_recognize(result_image, lang)
                     if html2markdown:
@@ -377,11 +407,22 @@ class PDFParsing():
                     # cv2.imwrite('./temp/temp_{}_{}.jpg'.format(str(page_id), str(i)),
                     #             result_image)
 
-                    structure_lis.append(result_image)
-                    if res_bbox:
-                        temp_lis.append({'text': '', 'type': line['type'], 'bbox': bbox, 'page': page_id})
+                    # structure_lis.append(result_image)
+                    # if res_bbox:
+                    #     temp_lis.append({'text': '', 'type': line['type'], 'bbox': bbox, 'page': page_id})
+                    # else:
+                    #     temp_lis.append({'text': '', 'type': line['type'], 'page': page_id})
+
+                    result_image = image[max(bbox[1] - 2, 0):bbox[3] + 3, max(bbox[0] - 5, 0):bbox[2] + 5, ::-1]
+                    # 🌟 新增容错拦截
+                    if result_image is not None and result_image.size > 0:
+                        structure_lis.append(result_image)
+                        if res_bbox:
+                            temp_lis.append({'text': '', 'type': line['type'], 'bbox': bbox, 'page': page_id})
+                        else:
+                            temp_lis.append({'text': '', 'type': line['type'], 'page': page_id})
                     else:
-                        temp_lis.append({'text': '', 'type': line['type'], 'page': page_id})
+                        print(f"警告: 截取的段落图像区域为空，已跳过。", flush=True)
 
             if len(structure_lis) > 0:
                 res_texts = self.ocr(structure_lis, lang)
