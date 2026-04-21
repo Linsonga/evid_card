@@ -1022,6 +1022,10 @@ def matching_zone(titles, batch_id, matcher, pipeline, materials, allowed_topic_
 
         # 🌟 改动：同时接收 topic_id 和 topic_name
         topic_id, topic_name = matcher.cardDistribution(title_vec, title, threshold=0.35, allowed_topic_ids=allowed_topic_ids)
+        # topic_id = 353
+        # title = '胃凉遇冷腹泻温通法则'
+        # info = query_and_audit(topic_id, title, batch_id, pipeline, materials, topic_name)
+        # exit()
 
         if topic_id:
             if matcher.filterExistingTitleInTopic(title, title_vec, topic_id):

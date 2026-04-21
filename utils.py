@@ -108,7 +108,7 @@ async def extract_text_from_image(file_path: str) -> str:
 
         data_uri = f"data:image/{mime_type};base64,{base64_image}"
 
-        client = AsyncOpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+        client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
 
         completion = client.chat.completions.create(
             model="qwen-vl-ocr-2025-11-20",

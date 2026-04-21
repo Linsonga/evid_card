@@ -15,7 +15,7 @@ import time
 import asyncio
 import subprocess
 from typing import List
-
+import pandas as pd
 import uvicorn
 import requests
 import pdfplumber
@@ -31,8 +31,8 @@ from utils import vector_4b, request_qwen_async
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity  # 🌟 新增相似度计算库
-from utils import vector_4b, request_qwen_async, extract_json_array_from_text, get_cached_vector
-
+from utils import vector_4b, request_qwen_async, extract_json_array_from_text, get_cached_vector, extract_text_from_image
+from xmindparser import xmind_to_dict
 import glob
 from multi_pdf_to_json_queue import PDFParsing, LAYOUT_PATH
 from matcher import QwenEmbeddingMatcher
@@ -237,17 +237,23 @@ def is_chinese_or_english(text, threshold=0.05):
         return "其他"
 
 
-def detect_pdf_type(pdf_path: str) -> str:
+
+
+def detect_pdf_type(file_path: str) -> str:
     """
-    分析 PDF 文件类型
+    分析文件类型
     返回: 'xmind' | 'image' | 'text'
     """
     try:
-
         print()
-        print(f"文件路劲：{pdf_path}")
+        print(f"文件路径：{file_path}")
 
-        with pdfplumber.open(pdf_path) as pdf:
+        # 【新增逻辑】：直接通过后缀名拦截原生 Xmind 文件
+        if file_path.lower().endswith('.xmind'):
+            return "xmind"
+
+        # 如果不是 .xmind 后缀，再尝试用 pdfplumber 按 PDF 解析
+        with pdfplumber.open(file_path) as pdf:
             if len(pdf.pages) == 0:
                 return "text"
 
@@ -284,7 +290,8 @@ def detect_pdf_type(pdf_path: str) -> str:
             return "text"
 
     except Exception as e:
-        print(f"检测 PDF 类型失败: {e}")
+        print(f"检测文件类型失败: {e}")
+        # 这里如果报错，可能是不受支持的格式或损坏的文件
         return "text"
 
 
@@ -321,84 +328,180 @@ def extract_text_from_pdf_with_plumber(pdf_path: str) -> list:
         print(f"[pdfplumber] PDF 文本提取失败: {e}")
     return content_list
 
+#
+# def chunk_text_data(content_list, split_to_length: int = 200):
+#     """核心分块逻辑：输入解析列表，输出分块后的列表"""
+#     if not content_list:
+#         return []
+#
+#     require_items = [x for x in content_list if x.get("type") in ("text", "title")]
+#     if not require_items:
+#         return []
+#
+#     require_list  = [x.get("text", "") for x in require_items]
+#     combined_text = "".join(require_list)
+#
+#     lang_detect = is_chinese_or_english(combined_text)
+#     if lang_detect == "中文":
+#         separators = ("。", "！", "!")
+#     else:
+#         separators = (". ", ".", "!", "！", "。")
+#
+#     new_block_list = []
+#
+#     for i, con in enumerate(require_items):
+#         t = (con.get("text") or "").strip()
+#         if lang_detect == "英文" and t:
+#             t += " "
+#
+#         current_bbox = con.get("bbox", [])
+#
+#         if not new_block_list:
+#             new_block_list.append({
+#                 "text": t,
+#                 "bbox": [current_bbox] if current_bbox else [],
+#                 "end_oldblock_type": con["type"]
+#             })
+#             continue
+#
+#         last           = new_block_list[-1]
+#         last_text      = last["text"]
+#         end_with_sep   = last_text.rstrip().endswith(separators)
+#         is_last_required = (con is require_items[-1])
+#
+#         if (
+#             len(last_text) < split_to_length
+#             or last["end_oldblock_type"] == "title"
+#             or (not end_with_sep)
+#             or is_last_required
+#         ):
+#             last["text"] += t
+#             if current_bbox:
+#                 last["bbox"].append(current_bbox)
+#             last["end_oldblock_type"] = con["type"]
+#         else:
+#             new_block_list.append({
+#                 "text": t,
+#                 "bbox": [current_bbox] if current_bbox else [],
+#                 "end_oldblock_type": con["type"]
+#             })
+#
+#     # 结尾小块并入前一块
+#     if len(new_block_list) >= 2 and len(new_block_list[-1]["text"]) < 300:
+#         new_block_list[-2]["text"] += new_block_list[-1]["text"]
+#         new_block_list[-2]["bbox"].extend(new_block_list[-1]["bbox"])
+#         new_block_list.pop()
+#
+#     final_res_list = []
+#     for index, block in enumerate(new_block_list):
+#         final_res_list.append({
+#             "text": block["text"],
+#             "index": index,
+#             "length": len(block["text"]),
+#             "bbox": block["bbox"]
+#         })
+#
+#     return final_res_list
 
-def chunk_text_data(content_list, split_to_length: int = 500):
-    """核心分块逻辑：输入解析列表，输出分块后的列表"""
+
+def chunk_text_data(content_list, split_to_length: int = 200):
+    """优化后的核心分块逻辑：支持深度拆分超长字符串，按标点断句组装"""
     if not content_list:
         return []
 
-    require_items = [x for x in content_list if x.get("type") in ("text", "title")]
+    # 1. 过滤出需要处理的文本块
+    require_items = [x for x in content_list if x.get("type") in ("text", "title") and x.get("text")]
     if not require_items:
         return []
 
-    require_list  = [x.get("text", "") for x in require_items]
-    combined_text = "".join(require_list)
-
-    lang_detect = is_chinese_or_english(combined_text)
-    if lang_detect == "中文":
-        separators = ("。", "！", "!")
-    else:
-        separators = (". ", ".", "!", "！", "。")
-
     new_block_list = []
+    current_text = ""
+    current_bboxes = []
+    last_type = ""
 
-    for i, con in enumerate(require_items):
-        t = (con.get("text") or "").strip()
-        if lang_detect == "英文" and t:
-            t += " "
+    # 🌟 核心改进 1：定义通用分句正则，支持中英文句号、感叹号、问号和换行符
+    # 使用 () 捕获组可以保留分隔符本身，不会在 split 时丢失标点
+    sentence_pattern = r'([。！？!\?\n]+)'
 
-        current_bbox = con.get("bbox", [])
-
-        if not new_block_list:
-            new_block_list.append({
-                "text": t,
-                "bbox": [current_bbox] if current_bbox else [],
-                "end_oldblock_type": con["type"]
-            })
+    for con in require_items:
+        t = con.get("text", "").strip()
+        if not t:
             continue
 
-        last           = new_block_list[-1]
-        last_text      = last["text"]
-        end_with_sep   = last_text.rstrip().endswith(separators)
-        is_last_required = (con is require_items[-1])
+        current_bbox = con.get("bbox", [])
+        item_type = con.get("type")
 
-        if (
-            len(last_text) < split_to_length
-            or last["end_oldblock_type"] == "title"
-            or (not end_with_sep)
-            or is_last_required
-        ):
-            last["text"] += t
-            if current_bbox:
-                last["bbox"].append(current_bbox)
-            last["end_oldblock_type"] = con["type"]
-        else:
-            new_block_list.append({
-                "text": t,
-                "bbox": [current_bbox] if current_bbox else [],
-                "end_oldblock_type": con["type"]
-            })
+        # 🌟 核心改进 2：强制将传入的文本（即使是几千字的整块）按标点打碎成句子列表
+        # 例如："你好。世界！" 会被 split 成 ["你好", "。", "世界", "！", ""]
+        pieces = re.split(sentence_pattern, t)
+        sentences = []
 
-    # 结尾小块并入前一块
-    if len(new_block_list) >= 2 and len(new_block_list[-1]["text"]) < 300:
+        # 将句子文本与后面的标点符号重新拼合
+        for i in range(0, len(pieces) - 1, 2):
+            sentence = pieces[i] + pieces[i + 1]
+            if sentence.strip():
+                sentences.append(sentence)
+        # 把结尾没有标点的一点残留加上
+        if len(pieces) % 2 != 0 and pieces[-1].strip():
+            sentences.append(pieces[-1])
+
+        if not sentences:
+            sentences = [t]
+
+        # 🌟 核心改进 3：遍历打碎后的短句，根据长度上限(split_to_length)重新组装
+        for sentence in sentences:
+            # 判断：如果当前积累的长度 + 新句子的长度 > 目标长度，且当前积累器里有东西
+            # （例外：如果上一个是 title，则强行跟下一段连着，不截断）
+            if (len(current_text) + len(sentence) > split_to_length) and len(current_text) > 0 and last_type != "title":
+                # 保存上一个块
+                new_block_list.append({
+                    "text": current_text,
+                    "bbox": current_bboxes.copy(),
+                    "end_oldblock_type": last_type
+                })
+                # 清空累加器，开启新块
+                current_text = sentence
+                current_bboxes = [current_bbox] if current_bbox else []
+            else:
+                # 长度还没超，继续累加拼接到当前块
+                current_text += sentence
+                if current_bbox and current_bbox not in current_bboxes:
+                    current_bboxes.append(current_bbox)
+
+            last_type = item_type
+
+    # 4. 循环结束后，把最后留在累加器里的尾巴内容存入 block
+    if current_text:
+        new_block_list.append({
+            "text": current_text,
+            "bbox": current_bboxes,
+            "end_oldblock_type": last_type
+        })
+
+    # 5. 结尾小块并入前一块的逻辑优化
+    # 为了防止把一个本来 180 字的块和 150 字的块合并成 330 字（超标）
+    # 我们只将非常短的尾巴（例如小于目标长度的 1/3）合并到上一块
+    min_tail_length = split_to_length // 3
+    if len(new_block_list) >= 2 and len(new_block_list[-1]["text"]) < min_tail_length:
         new_block_list[-2]["text"] += new_block_list[-1]["text"]
         new_block_list[-2]["bbox"].extend(new_block_list[-1]["bbox"])
         new_block_list.pop()
 
+    # 6. 构造最终返回的数据格式
     final_res_list = []
     for index, block in enumerate(new_block_list):
         final_res_list.append({
-            "text": block["text"],
+            "text": block["text"].strip(),
             "index": index,
-            "length": len(block["text"]),
+            "length": len(block["text"].strip()),
             "bbox": block["bbox"]
         })
 
     return final_res_list
 
 
-def convert_docx_to_pdf_sync(docx_path: str, output_dir: str):
-    """调用系统 LibreOffice 将 docx/doc 转换为 PDF"""
+def convert_office_to_pdf_sync(docx_path: str, output_dir: str):
+    """调用系统 LibreOffice 将 docx/doc/ppt/pptx 转换为 PDF"""
     command = [
         "soffice",
         "--headless",
@@ -449,6 +552,10 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
                 embeddings_list = vector_4b(text)
             except Exception as e:
                 print(f"[Milvus] 块 {index} 请求 Embedding API 报错: {e}")
+                continue
+
+            if not embeddings_list or not isinstance(embeddings_list, list) or len(embeddings_list) == 0:
+                print(f"[Milvus] 块 {index} 警告: 获取向量为空或无效，跳过此块数据。内容前缀: {text[:20]}...")
                 continue
 
             doc_id    = f"{task_id}_{index}"
@@ -710,12 +817,79 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 text_content = f.read()
             detected_lang = is_chinese_or_english(text_content)
             chunked_data  = chunk_text_data(
-                [{"type": "text", "text": text_content}], split_to_length=400
+                [{"type": "text", "text": text_content}], split_to_length=200
             )
             db_result = process_and_insert_to_milvus(
                 task_id, chunked_data, batch_id=batch_id, type='txt',
                 user_id=user_id, file_id=file_id
             )
+            # 🌟 ===== 分支三：Excel 文件 (新增) =====
+        # elif ext in ['.xlsx', '.xls', '.csv']:
+        #     print(f"[批次 {batch_id}] 任务 {task_id} 检测到表格类型({ext})，开始行列上下文绑定解析...")
+        #
+        #     try:
+        #         df_dict = {}
+        #
+        #         # 1. 区分文件类型进行读取
+        #         if ext == '.csv':
+        #             # 读取 CSV 时，加入编码 fallback 机制（应对国内常见的 GBK 编码）
+        #             try:
+        #                 df = pd.read_csv(file_path, encoding='utf-8')
+        #             except UnicodeDecodeError:
+        #                 df = pd.read_csv(file_path, encoding='gbk')
+        #             # 将单张表包装成字典结构，保持和 Excel 一致
+        #             df_dict = {"CSV数据": df}
+        #         else:
+        #             # 读取 Excel 所有的 Sheet 表
+        #             df_dict = pd.read_excel(file_path, sheet_name=None)
+        #
+        #         text_content_list = []
+        #
+        #         # 2. 统一的数据转换逻辑
+        #         for sheet_name, df in df_dict.items():
+        #             # 删除全空的行和列
+        #             df = df.dropna(how='all').dropna(axis=1, how='all')
+        #             if df.empty:
+        #                 continue
+        #
+        #             headers = df.columns.tolist()
+        #             # 遍历每一行，将结构化数据转换为带有上下文的自然语言段落
+        #             for index, row in df.iterrows():
+        #                 row_texts = []
+        #                 for col in headers:
+        #                     val = row[col]
+        #                     # 过滤掉空值（NaN / NaT 等）
+        #                     if pd.notna(val) and str(val).strip() != "":
+        #                         # 将列名和单元格值绑定
+        #                         row_texts.append(f"{col}: {val}")
+        #
+        #                 if row_texts:
+        #                     # 组装成一句话，保留了所在的表名和字段含义
+        #                     row_str = f"【表格数据 - 工作表:{sheet_name} 第{index + 1}行】 " + ", ".join(row_texts) + "。"
+        #                     text_content_list.append(row_str)
+        #
+        #         # 将所有转换后的行用换行符连接
+        #         full_excel_text = "\n".join(text_content_list)
+        #
+        #         if not full_excel_text.strip():
+        #             raise Exception(f"{ext} 文件中未提取到有效数据")
+        #
+        #         detected_lang = is_chinese_or_english(full_excel_text)
+        #
+        #         # 传入现有的分块函数
+        #         chunked_data = chunk_text_data(
+        #             [{"type": "text", "text": full_excel_text}], split_to_length=400
+        #         )
+        #
+        #         # 存入向量库 (可以将 type 统一标记为 'table' 或者保留 'excel')
+        #         db_result = process_and_insert_to_milvus(
+        #             task_id, chunked_data, batch_id=batch_id, type='table',
+        #             user_id=user_id, file_id=file_id
+        #         )
+        #     except ImportError:
+        #         raise Exception("缺少 pandas 库，请执行 pip install pandas")
+        #     except Exception as e:
+        #         raise Exception(f"表格解析失败: {str(e)}")
 
         # 🌟 ===== 分支二：图片文件 (新增) =====
         elif ext in ['.png', '.jpg', '.jpeg']:
@@ -741,27 +915,112 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             print(f"[批次 {batch_id}] 任务 {task_id} 检测到文档类型: {pdf_type}")
 
             if pdf_type == "xmind":
-                # xmind 思维导图：提取坐标节点 -> 大模型还原文本结构 -> 分块入库
                 detected_lang = "zh"
-                json_data     = extract_xmind_to_text(file_path)
-                prompt = f"""
-                    这是一个从思维导图（Xmind）导出的节点数据，包含了文本以及它们在页面上的物理坐标。
-                    X 是横坐标（越小越靠左），Y 是纵坐标（越小越靠上）。
-                    请你扮演一位逻辑分析专家，执行以下任务：
-                    隐式还原逻辑：请先在底层根据 X,Y 坐标的分布规律（如从左到右、从上到下的发散关系），理清各个节点之间的"父子、并列"等逻辑关联。
-                    提取核心大意：理解这个思维导图到底在表达什么主题，包含了哪些核心分支和细节。
-                    请抛弃列表或树状格式，将整个导图表达的意思融会贯通，用一段通顺、连贯的文字总结出来。只要总结内容，逻辑清晰，语言自然流畅。
-                    数据如下：
-                    {json_data}
-                """
-                xmind_str    = await request_qwen_async("", prompt)
+
+                # 【分支 A】：用户直接上传了原生 .xmind 文件
+                if file_path.lower().endswith('.xmind'):
+                    print(f"[批次 {batch_id}] 任务 {task_id} 使用原生 xmind 树状解析模式")
+
+                    # 1. 直接读取原生树状结构（自带完美的父子层级，无需 X,Y 坐标）
+                    # xmind_to_dict 会返回一个嵌套的字典，直接转为字符串给大模型
+                    try:
+                        xmind_dict = xmind_to_dict(file_path)
+                        json_data = str(xmind_dict)
+                    except Exception as e:
+                        print(f"解析原生 xmind 文件失败: {e}")
+                        json_data = "{}"
+
+                    # 2. 原生专属 Prompt：直接告诉模型这是树状结构，无需猜测方向
+                    prompt = f"""
+                        这是一个原生思维导图（Xmind）导出的纯净树状数据结构。
+                        数据本身已经通过嵌套层级完美体现了逻辑关联，不需要你进行任何坐标推断。
+            
+                        请你扮演一位极其严谨的知识提取专家，执行以下任务：
+            
+                        1. 全面提取与深度解析（绝不遗漏）：请仔细阅读这份层级数据，理解核心主题后，**提取其中的所有内容，绝不要只做概括性总结**。
+                           你需要逐一深入剖析每一个分支，将该分支下属的所有子节点、微小细节、具体数据等内容**全部囊括进去**。务必做到“每个分支越详细越好”，100%保留原始信息。
+            
+                        2. 整合输出（严格纯文本模式）：将整个导图表达的内容融会贯通，转化为一篇结构完整、内容极其详实的叙述性长文。
+                           - 【绝对禁止 Markdown】：不要使用任何 Markdown 语法！不要用 '#' 写标题，不要用 '**' 加粗，不要用 '*' 或 '-' 打列表，不要写代码块。
+                           - 【纯文本段落】：只输出干干净净的汉字和基础标点符号。请仅通过**换行（自然段落）**以及过渡性的连接词（如“首先”、“此外”、“具体而言”）来体现分支间的递进和并列关系。
+                           - 再次强调：不要省略任何细节，不要生成任何排版符号，只要详实的纯文本段落！
+                        数据如下：
+                        {json_data}
+                    """
+
+                # 【分支 B】：用户上传的是思维导图导出的 PDF 文件
+                else:
+                    print(f"[批次 {batch_id}] 任务 {task_id} 使用 PDF 坐标系推断模式")
+                    # 依赖您现有的 PDF 坐标提取逻辑
+                    json_data = extract_xmind_to_text(file_path)
+
+                    # 使用您之前确认过的、基于坐标推断的 Prompt
+                    prompt = f"""
+                        这是一个从思维导图导出的节点数据，包含了文本以及它们在页面上的物理坐标（X为横坐标，Y为纵坐标）。
+
+                        请你扮演一位极其严谨的知识提取专家，执行以下任务：
+
+                        1. 隐式还原逻辑：请注意，思维导图通常是“中心发散”结构的。请先通过坐标分布找出位于中心的“核心主题节点”。然后，根据其余节点相对于中心节点的物理距离、方向以及聚集规律，动态推断各个节点之间的"父子、并列"等逻辑关联。
+
+                        2. 全面提取与深度解析（绝不遗漏）：理解这个思维导图的主题后，请**提取其中的所有内容，绝不要只做概括性总结**。
+                           你需要逐一深入剖析每一个分支，将该分支下属的所有子节点等内容**全部囊括进去**，100%保留原始信息。
+
+                        3. 整合输出（严格纯文本模式）：转化为一篇内容极其详实的叙述性长文。
+                       - 【绝对禁止 Markdown】：不要使用任何 Markdown 语法（无 '#' 标题，无 '**' 加粗，无列表符号）。
+                       - 【纯文本段落】：只输出纯文本。仅通过**换行**和自然的文字叙述来划分段落。
+                       - 再次强调：不要省略任何细节，拒绝任何特殊排版字符！
+                        数据如下：
+                        {json_data}
+                    """
+
+                # 调用大模型生成长文本
+                xmind_str = await request_qwen_async("", prompt)
+
+                # 打印检查（可用于调试）
+
+                # 将详实的文本分块并存入 Milvus 向量数据库
                 chunked_data = chunk_text_data(
-                    [{"type": "text", "text": xmind_str}], split_to_length=400
+                    [{"type": "text", "text": xmind_str}], split_to_length=200
                 )
+                print(chunked_data)
                 db_result = process_and_insert_to_milvus(
                     task_id, chunked_data, batch_id=batch_id, type='xmind',
                     user_id=user_id, file_id=file_id
                 )
+
+            # if pdf_type == "xmind":
+            #     # xmind 思维导图：提取坐标节点 -> 大模型还原文本结构 -> 分块入库
+            #     detected_lang = "zh"
+            #     json_data     = extract_xmind_to_text(file_path)
+            #     prompt = f"""
+            #         这是一个从思维导图（Xmind等）导出的节点数据，包含了文本以及它们在页面上的物理坐标（X为横坐标，Y为纵坐标）。
+            #
+            #         请你扮演一位极其严谨的知识提取专家，执行以下任务：
+            #
+            #         1. 隐式还原逻辑：请注意，思维导图通常是“中心发散”结构的（核心主题在中央，向左右或四周扩散）。
+            #            请先通过坐标分布找出位于中心的“核心主题节点”。然后，根据其余节点相对于中心节点的物理距离、方向以及聚集规律，动态推断各个节点之间的"父子、并列"等逻辑关联。
+            #
+            #         2. 全面提取与深度解析（绝不遗漏）：理解这个思维导图的主题后，请**提取其中的所有内容，绝不要只做概括性总结**。
+            #            你需要逐一深入剖析每一个分支，将该分支下属的所有子节点、微小细节、具体数据或举例等内容**全部囊括进去**。务必做到“每个分支越详细越好”，100%保留原始导图中的所有有效信息。
+            #
+            #         3. 整合输出：请抛弃干瘪的列表或树状格式，将整个导图表达的内容融会贯通，转化为一篇**结构完整、逻辑严密、内容极其详实的叙述性长文或报告**。
+            #            - 请通过自然的段落划分和过渡句，来清晰地体现各个分支与子分支之间的递进和并列关系。
+            #            - 语言必须自然流畅，像是一篇详细的专业文章，而不是简单的节点罗列。
+            #            - 再次强调：不要省略任何细节，力求详尽！
+            #
+            #         数据如下：
+            #         {json_data}
+            #     """
+            #     xmind_str    = await request_qwen_async("", prompt)
+            #     print(xmind_str)
+            #     exit()
+            #     chunked_data = chunk_text_data(
+            #         [{"type": "text", "text": xmind_str}], split_to_length=400
+            #     )
+            #     db_result = process_and_insert_to_milvus(
+            #         task_id, chunked_data, batch_id=batch_id, type='xmind',
+            #         user_id=user_id, file_id=file_id
+            #     )
 
 
             else:
@@ -779,7 +1038,10 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
 
                 # 2. 分块
                 chunked_data = chunk_text_data(data_lis, split_to_length=400)
-
+                print()
+                print("分块内容 ：")
+                print(chunked_data)
+                print()
                 # 3. 向量化并入库（共用 batch_id）
                 print(f"[批次 {batch_id}] 任务 {task_id} 开始入库...")
                 db_result = process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_id=file_id)
@@ -978,7 +1240,8 @@ async def create_upload_batch_from_url(
     if not files:
         raise HTTPException(status_code=400, detail="请至少提供一个文件")
 
-    SUPPORTED_EXTS = {'.pdf', '.xmind', '.txt', '.docx', '.doc'}
+    # SUPPORTED_EXTS = {'.pdf', '.xmind', '.txt', '.docx', '.doc', '.ppt', '.pptx', '.xlsx', '.xls', '.csv'}
+    SUPPORTED_EXTS = {'.pdf', '.xmind', '.txt', '.docx', '.doc', '.ppt', '.pptx', '.png', '.jpg', '.jpeg'}
 
     # 整批共用同一个 batch_id
     batch_id  = str(uuid.uuid4())
@@ -1020,21 +1283,23 @@ async def create_upload_batch_from_url(
             )
 
         # ── 步骤 2：Word 文件同步转换为 PDF ──
-        if ext in ('.docx', '.doc'):
+        if ext in ('.docx', '.doc', '.ppt', '.pptx'):
             final_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
             try:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
-                    None, convert_docx_to_pdf_sync, download_path, UPLOAD_DIR
+                    None, convert_office_to_pdf_sync, download_path, UPLOAD_DIR
                 )
+                # 转换成功后，删除原始的 docx/ppt 临时文件
                 if os.path.exists(download_path):
                     os.remove(download_path)
             except Exception as e:
+                # 如果转换失败也要清理临时文件
                 if os.path.exists(download_path):
                     os.remove(download_path)
                 raise HTTPException(
                     status_code=500,
-                    detail=f"文件 [{file_name}] Word转PDF失败: {str(e)}"
+                    detail=f"文件 [{file_name}] 转PDF失败: {str(e)}"
                 )
 
         # ── 步骤 3：初始化任务状态文件 ──

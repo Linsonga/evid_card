@@ -286,6 +286,78 @@ def check_dynamic_issue(title, core_conclusion, issue_name):
     return extract_json_from_text(res)
 
 
+def build_materials_and_references(materials_part_data):
+    """
+    从 materials_part 数据中提取并格式化：
+    1. 给大模型阅读的带编号正文材料 (formatted_materials)
+    2. 放在文末的标准参考文献列表 (reference_list)
+    """
+    formatted_materials = []
+    formatted_references = []
+    ref_index = 1
+
+    # 遍历外部数组
+    for item in materials_part_data:
+        # 获取内嵌的 info JSON 字符串
+        info_str = item.get("info", "{}")
+
+        try:
+            info_dict = json.loads(info_str)
+        except json.JSONDecodeError:
+            continue  # 如果解析 JSON 失败，跳过该条目
+
+        # 提取 reference 列表（包含了论文、指南等）
+        references = info_dict.get("reference", [])
+
+        for ref in references:
+            # === 1. 提取作者/制定者 ===
+            author_list = ref.get("author", [])
+            if author_list:
+                author = ";".join(author_list)
+            else:
+                # 指南类文献通常没有 author 字段，而是有 zdz (制定者)
+                author = ref.get("zdz", "佚名")
+
+            # === 2. 提取标题 ===
+            # 有的叫 title，有的叫 literatureTitle，这里做个兼容
+            title = ref.get("title") or ref.get("literatureTitle", "未知标题")
+
+            # === 3. 提取期刊出处 ===
+            journal = ref.get("journal", "")
+            if not journal:
+                # 指南类没有 journal，通常在 cc 字段，格式如 "中医杂志.2021..."
+                cc = ref.get("cc", "")
+                journal = cc.split(".")[0] if "." in cc else cc
+            if not journal:
+                journal = "未知出处"
+
+            # === 4. 提取年份 ===
+            year = ref.get("year", "未知年份")
+
+            # === 5. 提取摘要/核心内容 ===
+            # 论文通常是 summary，指南通常是 nrjs (内容介绍)
+            summary = ref.get("summary", "")
+            if not summary:
+                summary = ref.get("nrjs", "缺少具体摘要内容，请结合标题及临床经验推断。")
+
+            # === 6. 组装：给大模型阅读的【资料 X】 ===
+            material_text = f"【资料 {ref_index}】\n文献标题：{title}\n文献出处：{journal} ({year})\n核心内容：{summary}\n"
+            formatted_materials.append(material_text)
+
+            # === 7. 组装：文末的 [X] 参考文献 ===
+            # 格式：[序号] 作者.标题[J]. 期刊,年份
+            ref_str = f"[{ref_index}] {author}.{title}[J]. {journal},{year}"
+            formatted_references.append(ref_str)
+
+            # 递增序号
+            ref_index += 1
+
+    # 将数组拼接为带有换行符的字符串
+    materials_text = "\n".join(formatted_materials)
+    references_text = "\n".join(formatted_references)
+
+    return materials_text, references_text
+
 async def run_wechat_mcp_example(articles):
     """
     批量发布微信公众号文章（最多8篇）
@@ -692,6 +764,7 @@ class AgenticPipeline:
 
         return "\n".join(parts)
 
+
     def run_round(self, data_list, title, batch_id, materials, zone_name="通用医学专区"):
         """
         运行带有【反思重试环】和【动态树记忆】的迭代流水线
@@ -700,11 +773,11 @@ class AgenticPipeline:
 
         passed_data = []
         failed_data = []
-        MAX_RETRIES = 2  # 每条数据最多抢救2次
+        MAX_RETRIES = 1  # 每条数据最多抢救2次
 
         # 1. 精准提取当前专区的避坑规则
         local_rules = self.retrieve_local_memories(zone_name)
-        pass_score_threshold = 80 if (not batch_id or batch_id == "GLOBAL_ALL") else 95
+        pass_score_threshold = 70 if (not batch_id or batch_id == "GLOBAL_ALL") else 80
 
         for item in data_list:
             current_title = item["title"]
@@ -816,7 +889,8 @@ class AgenticPipeline:
                         conn.close()
 
                 print(f">> 正在生成高分专区卡片: {pass_title}")
-                materials_part = f"{materials}\n" if materials else ""
+                formatted_materials = f"{materials}\n" if materials else ""
+                reference_list = ""
 
                 system_prompt = '你现在是“医学证据卡片选题总编 + 临床知识编辑”。'
                 user_prompt = f"""
@@ -912,15 +986,6 @@ class AgenticPipeline:
                 with open(os.path.join(output_dir, f"_{safe_title}.md"), "w", encoding="utf-8") as f:
                     f.write(card_res)
 
-                # Step 5：发布微信公众号
-                logger.info(">> 合格数据 执行 Step 5: 发布微信公众号... 暂时先不发...")
-                # # 构建文章列表（最多8篇）
-                # articles = [{
-                #     "title": pass_title,
-                #     "content": card_res,
-                #     "image_paths": []  # 多图如 ["img1.jpg", "img2.jpg"]
-                # }]
-                # asyncio.run(run_wechat_mcp_example(articles))
 
         return True
 
