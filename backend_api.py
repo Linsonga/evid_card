@@ -517,13 +517,10 @@ def convert_office_to_pdf_sync(docx_path: str, output_dir: str):
         raise Exception("找不到 soffice 命令，请确保服务器安装了 LibreOffice 并配置了环境变量")
 
 
-
-def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str = None, type: str = 'pdf', user_id: str = '', file_id: int = 0):
+def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str = None, type: str = 'pdf',
+                                 user_id: str = '', file_id: int = 0):
     """
     遍历分块数据，调用 Embedding 接口，批量写入 Milvus。
-    batch_id:  同一批次的多个文件共用同一个 batch_id；不传则默认使用 task_id。
-    user_id:   文件所属用户 ID。
-    file_name: 原始文件名称。
     """
     if batch_id is None:
         batch_id = task_id
@@ -531,19 +528,26 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
         return {"status": "error", "msg": "没有有效的分块数据可供插入"}
 
     filtered_count = 0
-    # 🌟 新增三个列表，用于收集有效数据
     valid_embeddings = []
     valid_texts = []
     valid_metadata = []
 
+    # 批量入库的数组
+    to_insert_batch = []
+
     try:
         for index, item in enumerate(chunked_data):
             text = item.get("text", "").strip()
+
+            # 🌟 严控条件 1：如果切块文本为空，直接判定为解析失败
             if not text:
-                continue
+                return {"status": "error", "msg": f"解析失败：分块 {index} 文本为空"}
+
             if type == 'pdf':
                 if len(text) > 600:
                     continue
+
+            # （保留原有逻辑）如果是乱码或过短，先跳过，由循环结束后的 to_insert_batch 兜底判断
             if is_garbage_text(text):
                 filtered_count += 1
                 continue
@@ -551,34 +555,39 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
             try:
                 embeddings_list = vector_4b(text)
             except Exception as e:
-                print(f"[Milvus] 块 {index} 请求 Embedding API 报错: {e}")
-                continue
+                # 🌟 严控条件 2：Embedding 报错，直接判定为解析失败
+                return {"status": "error", "msg": f"解析失败：分块 {index} 请求 Embedding API 报错: {str(e)}"}
 
             if not embeddings_list or not isinstance(embeddings_list, list) or len(embeddings_list) == 0:
-                print(f"[Milvus] 块 {index} 警告: 获取向量为空或无效，跳过此块数据。内容前缀: {text[:20]}...")
-                continue
+                # 🌟 严控条件 3：向量获取为空或无效，直接判定为解析失败
+                return {"status": "error", "msg": f"解析失败：分块 {index} 获取向量为空或无效"}
 
-            doc_id    = f"{task_id}_{index}"
-            to_insert = [{
-                "id":        doc_id,
-                "vector":    embeddings_list,
-                "batch_id":  batch_id,
-                "text":      text,
-                "date":  str(int(time.time())),
-                "user_id":   user_id,
-                "file_id": file_id,  # 🌟 修改：这里存入 file_id，取代之前的 file_name
-            }]
-            milvus_client.insert(collection_name=MILVUS_COLLECTION_MAIN, data=to_insert)
+            doc_id = f"{task_id}_{index}"
 
-            # 🌟 收集有效数据供大模型挖掘使用
+            to_insert_batch.append({
+                "id": doc_id,
+                "vector": embeddings_list,
+                "batch_id": batch_id,
+                "text": text,
+                "date": str(int(time.time())),
+                "user_id": user_id,
+                "file_id": file_id,
+            })
+
             valid_embeddings.append(embeddings_list)
             valid_texts.append(text)
-            valid_metadata.append(f"来源文件ID: {file_id}")  # 🌟 修改：素材标识也改成 ID
+            valid_metadata.append(f"来源文件ID: {file_id}")
+
+            # 如果全是乱码被过滤，导致没有有效数据，返回 error
+        if not to_insert_batch:
+            return {"status": "error", "msg": "解析失败：文本内容过短(小于50字)或全为无效乱码，无有效数据入库"}
+
+        # 执行统一批量插入
+        milvus_client.insert(collection_name=MILVUS_COLLECTION_MAIN, data=to_insert_batch)
 
     except Exception as e:
         return {"status": "error", "msg": f"Milvus 入库失败: {str(e)}"}
 
-    # 🌟 修改返回结构：将数据一同返回
     return {
         "status": "success",
         "filtered_count": filtered_count,
@@ -902,8 +911,11 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             detected_lang = is_chinese_or_english(text_content)
             # 组装成分块所需的格式
             chunked_data = chunk_text_data(
-                [{"type": "text", "text": text_content}], split_to_length=400
+                [{"type": "text", "text": text_content}], split_to_length=200
             )
+            print(f"解析图片中的内容：")
+            print(chunked_data)
+            print()
             # 入库，type 标记为 'image'
             db_result = process_and_insert_to_milvus(
                 task_id, chunked_data, batch_id=batch_id, type='image',
@@ -988,41 +1000,6 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                     user_id=user_id, file_id=file_id
                 )
 
-            # if pdf_type == "xmind":
-            #     # xmind 思维导图：提取坐标节点 -> 大模型还原文本结构 -> 分块入库
-            #     detected_lang = "zh"
-            #     json_data     = extract_xmind_to_text(file_path)
-            #     prompt = f"""
-            #         这是一个从思维导图（Xmind等）导出的节点数据，包含了文本以及它们在页面上的物理坐标（X为横坐标，Y为纵坐标）。
-            #
-            #         请你扮演一位极其严谨的知识提取专家，执行以下任务：
-            #
-            #         1. 隐式还原逻辑：请注意，思维导图通常是“中心发散”结构的（核心主题在中央，向左右或四周扩散）。
-            #            请先通过坐标分布找出位于中心的“核心主题节点”。然后，根据其余节点相对于中心节点的物理距离、方向以及聚集规律，动态推断各个节点之间的"父子、并列"等逻辑关联。
-            #
-            #         2. 全面提取与深度解析（绝不遗漏）：理解这个思维导图的主题后，请**提取其中的所有内容，绝不要只做概括性总结**。
-            #            你需要逐一深入剖析每一个分支，将该分支下属的所有子节点、微小细节、具体数据或举例等内容**全部囊括进去**。务必做到“每个分支越详细越好”，100%保留原始导图中的所有有效信息。
-            #
-            #         3. 整合输出：请抛弃干瘪的列表或树状格式，将整个导图表达的内容融会贯通，转化为一篇**结构完整、逻辑严密、内容极其详实的叙述性长文或报告**。
-            #            - 请通过自然的段落划分和过渡句，来清晰地体现各个分支与子分支之间的递进和并列关系。
-            #            - 语言必须自然流畅，像是一篇详细的专业文章，而不是简单的节点罗列。
-            #            - 再次强调：不要省略任何细节，力求详尽！
-            #
-            #         数据如下：
-            #         {json_data}
-            #     """
-            #     xmind_str    = await request_qwen_async("", prompt)
-            #     print(xmind_str)
-            #     exit()
-            #     chunked_data = chunk_text_data(
-            #         [{"type": "text", "text": xmind_str}], split_to_length=400
-            #     )
-            #     db_result = process_and_insert_to_milvus(
-            #         task_id, chunked_data, batch_id=batch_id, type='xmind',
-            #         user_id=user_id, file_id=file_id
-            #     )
-
-
             else:
                 # 1. GPU 解析
                 async with gpu_lock:
@@ -1037,7 +1014,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                     )
 
                 # 2. 分块
-                chunked_data = chunk_text_data(data_lis, split_to_length=400)
+                chunked_data = chunk_text_data(data_lis, split_to_length=200)
                 print()
                 print("分块内容 ：")
                 print(chunked_data)
@@ -1082,6 +1059,12 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
 
     except Exception as e:
         print(f"[批次 {batch_id}] 任务 {task_id} 失败: {str(e)}")
+        error_str = str(e)
+        # 🌟 新增：拦截 PDF 加密异常，替换为友好的用户提示
+        if "encrypted" in error_str.lower() or "password" in error_str.lower():
+            friendly_error_msg = "文档加密，请解密后重新上传"
+        else:
+            friendly_error_msg = type(e).__name__ + ": " + error_str
 
         # 🌟 捕获任何阶段的异常（下载后解析失败、分块失败等）：更新状态为 2
         update_file_parse_status(file_id, 2)
@@ -1090,7 +1073,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             "task_id":   task_id,
             "batch_id":  batch_id,
             "status":    "failed",
-            "error_msg": type(e).__name__ + ": " + str(e)
+            "error_msg": friendly_error_msg
         }
         with open(result_file, "w", encoding="utf-8") as f:
             json.dump(error_data, f, ensure_ascii=False, indent=2)
@@ -1213,157 +1196,255 @@ async def background_generate_titles(file_id: int, user_id: int):
 
 
 
+
+
 # ================= 接口一：OSS URL 批量提交解析入库 =================
+
+async def download_convert_and_process(file_url: str, download_path: str, ext: str, task_id: str, batch_id: str,
+                                       user_id: str, file_name: str, file_id: int):
+    """后台全流程：独立线程下载 -> (转PDF) -> 解析分块入库"""
+    loop = asyncio.get_running_loop()
+    final_path = download_path
+
+    try:
+        # ── 1. 在后台执行下载 ──
+        def download_file_sync(url, path):
+            response = requests.get(url, timeout=600)
+            response.raise_for_status()
+            with open(path, 'wb') as f:
+                f.write(response.content)
+
+        await loop.run_in_executor(None, download_file_sync, file_url, download_path)
+        print(f"[后台下载成功] {file_name}  ->  {download_path}")
+
+        # ── 2. 在后台执行 Office 转 PDF ──
+        if ext in ('.docx', '.doc', '.ppt', '.pptx'):
+            final_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
+            await loop.run_in_executor(None, convert_office_to_pdf_sync, download_path, UPLOAD_DIR)
+            # 转换成功后删除源文件
+            if os.path.exists(download_path):
+                os.remove(download_path)
+
+    except Exception as e:
+        print(f"❌ [任务 {task_id}] 下载或转换失败: {e}")
+        # 失败时更新 MySQL 状态为 2
+        update_file_parse_status(file_id, 2)
+
+        # 记录失败状态到文件
+        error_data = {
+            "task_id": task_id,
+            "batch_id": batch_id,
+            "status": "failed",
+            "error_msg": f"文件下载或转换异常: {str(e)}"
+        }
+        with open(os.path.join(RESULT_DIR, f"{task_id}.json"), "w", encoding="utf-8") as f:
+            json.dump(error_data, f, ensure_ascii=False, indent=2)
+
+        # 清理残余文件
+        if os.path.exists(download_path):
+            os.remove(download_path)
+        return  # 直接终止，不再进入后续解析
+
+    # ── 3. 下载转换均成功，进入核心解析环节 ──
+    # 这里直接调用原有的处理入口
+    await background_process_pdf_batch(task_id, batch_id, final_path, user_id, file_name, file_id)
+
+
 @app.post("/api/v1/analysis_file")
 async def create_upload_batch_from_url(
-    background_tasks: BackgroundTasks,
-    files: List[FileCallbackItem]
+        background_tasks: BackgroundTasks,
+        files: List[FileCallbackItem]
 ):
     """
-    接收线上 OSS 文件列表，自动下载后解析、分块并写入向量库。
-
-    支持格式：PDF、xmind（PDF导出格式）、TXT、Word（docx / doc）
-    Word 文件会先通过 LibreOffice 转换为 PDF 再处理。
-
-    请求体示例：
-    [
-      {
-        "file_url": "https://image.evimed.com/oss/evidence-card/xxx.pdf",
-        "user_id": "5724839605178470186",
-        "file_name": "(2006_BSG)肝硬化腹水的管理指南.pdf",
-        "id": 9
-      }
-    ]
-
-    立即返回 batch_id 与每个文件对应的 task_id，后续可通过 task_id 查询进度。
+    接收线上 OSS 文件列表，极速返回响应。
+    下载、解析、分块、入库全部交由后台任务处理。
     """
     if not files:
         raise HTTPException(status_code=400, detail="请至少提供一个文件")
 
-    # SUPPORTED_EXTS = {'.pdf', '.xmind', '.txt', '.docx', '.doc', '.ppt', '.pptx', '.xlsx', '.xls', '.csv'}
     SUPPORTED_EXTS = {'.pdf', '.xmind', '.txt', '.docx', '.doc', '.ppt', '.pptx', '.png', '.jpg', '.jpeg'}
 
-    # 整批共用同一个 batch_id
-    batch_id  = str(uuid.uuid4())
+    batch_id = str(uuid.uuid4())
     task_list = []
 
     for file in files:
-        file_url   = file.file_url
-        file_name  = file.file_name
-        ext        = os.path.splitext(file_name.lower())[-1]
+        file_url = file.file_url
+        file_name = file.file_name
+        ext = os.path.splitext(file_name.lower())[-1]
 
         if ext not in SUPPORTED_EXTS:
             raise HTTPException(
                 status_code=400,
-                detail=f"文件 [{file_name}] 格式不支持，仅允许 PDF、xmind、TXT、Word(docx/doc)"
+                detail=f"文件 [{file_name}] 格式不支持"
             )
 
-        task_id       = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
         download_path = os.path.join(UPLOAD_DIR, f"{task_id}{ext}")
-        final_path    = download_path
 
-        # ── 步骤 1：从 OSS 异步下载文件（🌟 修复阻塞问题） ──
-        try:
-            # 使用 asyncio.to_thread 或 run_in_executor 将同步下载放入独立线程，不阻塞主线程
-            loop = asyncio.get_running_loop()
-
-            def download_file_sync(url, path):
-                response = requests.get(url, timeout=600)  # 给大文件长一点的超时时间
-                response.raise_for_status()
-                with open(path, 'wb') as f:
-                    f.write(response.content)
-
-            await loop.run_in_executor(None, download_file_sync, file_url, download_path)
-            print(f"[下载成功] {file_name}  ->  {download_path}")
-
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"下载文件 [{file_name}] 失败: {str(e)}"
-            )
-
-        # ── 步骤 2：Word 文件同步转换为 PDF ──
-        if ext in ('.docx', '.doc', '.ppt', '.pptx'):
-            final_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None, convert_office_to_pdf_sync, download_path, UPLOAD_DIR
-                )
-                # 转换成功后，删除原始的 docx/ppt 临时文件
-                if os.path.exists(download_path):
-                    os.remove(download_path)
-            except Exception as e:
-                # 如果转换失败也要清理临时文件
-                if os.path.exists(download_path):
-                    os.remove(download_path)
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"文件 [{file_name}] 转PDF失败: {str(e)}"
-                )
-
-        # ── 步骤 3：初始化任务状态文件 ──
+        # ── 步骤 1：仅初始化任务状态文件，极速完成 ──
         initial_status = {
-            "task_id":   task_id,
-            "batch_id":  batch_id,
-            "file_id":   file.id,
+            "task_id": task_id,
+            "batch_id": batch_id,
+            "file_id": file.id,
             "file_name": file_name,
-            "user_id":   file.user_id,
-            "status":    "processing"
+            "user_id": file.user_id,
+            "status": "downloading"  # 状态改为下载中
         }
         with open(os.path.join(RESULT_DIR, f"{task_id}.json"), "w", encoding="utf-8") as fp:
             json.dump(initial_status, fp, ensure_ascii=False)
 
-        # ── 步骤 4：加入后台解析队列（解析 + 分块 + 入库，共用 batch_id）──
+        # ── 步骤 2：把【下载+转换+解析】一口气全塞进后台 ──
         background_tasks.add_task(
-            background_process_pdf_batch,
+            download_convert_and_process,
+            file_url,
+            download_path,
+            ext,
             task_id,
             batch_id,
-            final_path,
             file.user_id,
             file_name,
-            file.id  # 传入文件ID
+            file.id
         )
+
         task_list.append({
-            "task_id":  task_id,
-            "file_id":  file.id,
+            "task_id": task_id,
+            "file_id": file.id,
             "filename": file_name
         })
 
+    # 接口不等待下载，立刻返回响应给客户端
     return JSONResponse(content={
-        "code":     200,
-        "msg":      f"批量提交成功，共 {len(task_list)} 个文件已加入解析队列",
+        "code": 200,
+        "msg": f"批量提交成功，共 {len(task_list)} 个文件已加入后台下载与解析队列",
         "batch_id": batch_id,
-        "tasks":    task_list
+        "tasks": task_list
     })
 
 
+#
+# @app.post("/api/v1/analysis_file")
+# async def create_upload_batch_from_url(
+#     background_tasks: BackgroundTasks,
+#     files: List[FileCallbackItem]
+# ):
+#     """
+#     接收线上 OSS 文件列表，自动下载后解析、分块并写入向量库。
+#
+#     支持格式：PDF、xmind（PDF导出格式）、TXT、Word（docx / doc）
+#     Word 文件会先通过 LibreOffice 转换为 PDF 再处理。
+#
+#     请求体示例：
+#     [
+#       {
+#         "file_url": "https://image.evimed.com/oss/evidence-card/xxx.pdf",
+#         "user_id": "5724839605178470186",
+#         "file_name": "(2006_BSG)肝硬化腹水的管理指南.pdf",
+#         "id": 9
+#       }
+#     ]
+#
+#     立即返回 batch_id 与每个文件对应的 task_id，后续可通过 task_id 查询进度。
+#     """
+#     if not files:
+#         raise HTTPException(status_code=400, detail="请至少提供一个文件")
+#
+#     # SUPPORTED_EXTS = {'.pdf', '.xmind', '.txt', '.docx', '.doc', '.ppt', '.pptx', '.xlsx', '.xls', '.csv'}
+#     SUPPORTED_EXTS = {'.pdf', '.xmind', '.txt', '.docx', '.doc', '.ppt', '.pptx', '.png', '.jpg', '.jpeg'}
+#
+#     # 整批共用同一个 batch_id
+#     batch_id  = str(uuid.uuid4())
+#     task_list = []
+#
+#     for file in files:
+#         file_url   = file.file_url
+#         file_name  = file.file_name
+#         ext        = os.path.splitext(file_name.lower())[-1]
+#
+#         if ext not in SUPPORTED_EXTS:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail=f"文件 [{file_name}] 格式不支持，仅允许 PDF、xmind、TXT、Word(docx/doc)"
+#             )
+#
+#         task_id       = str(uuid.uuid4())
+#         download_path = os.path.join(UPLOAD_DIR, f"{task_id}{ext}")
+#         final_path    = download_path
+#
+#         # ── 步骤 1：从 OSS 异步下载文件（🌟 修复阻塞问题） ──
+#         try:
+#             # 使用 asyncio.to_thread 或 run_in_executor 将同步下载放入独立线程，不阻塞主线程
+#             loop = asyncio.get_running_loop()
+#
+#             def download_file_sync(url, path):
+#                 response = requests.get(url, timeout=600)  # 给大文件长一点的超时时间
+#                 response.raise_for_status()
+#                 with open(path, 'wb') as f:
+#                     f.write(response.content)
+#
+#             await loop.run_in_executor(None, download_file_sync, file_url, download_path)
+#             print(f"[下载成功] {file_name}  ->  {download_path}")
+#
+#         except Exception as e:
+#             raise HTTPException(
+#                 status_code=500,
+#                 detail=f"下载文件 [{file_name}] 失败: {str(e)}"
+#             )
+#
+#         # ── 步骤 2：Word 文件同步转换为 PDF ──
+#         if ext in ('.docx', '.doc', '.ppt', '.pptx'):
+#             final_path = os.path.join(UPLOAD_DIR, f"{task_id}.pdf")
+#             try:
+#                 loop = asyncio.get_running_loop()
+#                 await loop.run_in_executor(
+#                     None, convert_office_to_pdf_sync, download_path, UPLOAD_DIR
+#                 )
+#                 # 转换成功后，删除原始的 docx/ppt 临时文件
+#                 if os.path.exists(download_path):
+#                     os.remove(download_path)
+#             except Exception as e:
+#                 # 如果转换失败也要清理临时文件
+#                 if os.path.exists(download_path):
+#                     os.remove(download_path)
+#                 raise HTTPException(
+#                     status_code=500,
+#                     detail=f"文件 [{file_name}] 转PDF失败: {str(e)}"
+#                 )
+#
+#         # ── 步骤 3：初始化任务状态文件 ──
+#         initial_status = {
+#             "task_id":   task_id,
+#             "batch_id":  batch_id,
+#             "file_id":   file.id,
+#             "file_name": file_name,
+#             "user_id":   file.user_id,
+#             "status":    "processing"
+#         }
+#         with open(os.path.join(RESULT_DIR, f"{task_id}.json"), "w", encoding="utf-8") as fp:
+#             json.dump(initial_status, fp, ensure_ascii=False)
+#
+#         # ── 步骤 4：加入后台解析队列（解析 + 分块 + 入库，共用 batch_id）──
+#         background_tasks.add_task(
+#             background_process_pdf_batch,
+#             task_id,
+#             batch_id,
+#             final_path,
+#             file.user_id,
+#             file_name,
+#             file.id  # 传入文件ID
+#         )
+#         task_list.append({
+#             "task_id":  task_id,
+#             "file_id":  file.id,
+#             "filename": file_name
+#         })
+#
+#     return JSONResponse(content={
+#         "code":     200,
+#         "msg":      f"批量提交成功，共 {len(task_list)} 个文件已加入解析队列",
+#         "batch_id": batch_id,
+#         "tasks":    task_list
+#     })
 
-# ================= 接口二：文件处理完成回调（原有接口，保持不变） =================
-@app.post("/api/v1/analysis_file2", status_code=200)
-async def update_file_status(files: List[FileCallbackItem]):
-    """
-    接收文件处理完成的回调，更新数据库状态
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="请求数据不能为空")
-
-    valid_ids = []
-    for file in files:
-        try:
-            valid_ids.append(file.id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"文件 ID [{file.id}] 格式错误，无法转换为数字")
-
-    if not valid_ids:
-        return {"code": 200, "message": "没有需要更新的数据"}
-
-    try:
-        mock_db_execute_update(files)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"数据库更新失败: {str(e)}")
-
-    return {"code": 200, "message": "success"}
 
 
 
