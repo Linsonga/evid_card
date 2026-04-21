@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pymilvus import MilvusClient
 
-from config import DB_CONFIG, MILVUS_MAIN_URI, MILVUS_MAIN_TOKEN
+from config import DB_CONFIG, MILVUS_MAIN_URI, MILVUS_MAIN_TOKEN, PORT
 from utils import vector_4b, request_qwen_async
 # 🌟 新增导入：KMeans, numpy 和 JSON提取工具
 import numpy as np
@@ -1475,4 +1475,4 @@ async def generate_titles_endpoint(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5911, workers=1)
+    uvicorn.run(app, host="0.0.0.0", port=int(PORT), workers=1)
