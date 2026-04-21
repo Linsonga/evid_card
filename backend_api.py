@@ -37,7 +37,11 @@ import glob
 from multi_pdf_to_json_queue import PDFParsing, LAYOUT_PATH
 from matcher import QwenEmbeddingMatcher
 from audit import AgenticPipeline
-
+import asyncio
+from functools import partial
+import time
+import concurrent.futures
+from typing import List, Dict, Any
 
 app = FastAPI(title="文件处理回调接口")
 
@@ -114,6 +118,21 @@ def is_garbage_text(text: str) -> bool:
     else:
         # 既不像中文也不像英文，判为乱码
         return True
+
+
+
+# --- 新增：把同步入库过程包装到线程池中运行 ---
+async def async_process_and_insert_to_milvus(*args, **kwargs):
+    """
+    包装器：将耗时的同步执行函数 process_and_insert_to_milvus 放入子线程，
+    防止其阻塞 FastAPI 的主事件循环。
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(process_and_insert_to_milvus, *args, **kwargs)
+    )
+
 
 # ================= 🌟 修改点 2：新增获取历史卡片函数 =================
 def get_user_history_titles(user_id: int) -> list:
@@ -422,7 +441,7 @@ def extract_text_from_pdf_with_plumber(pdf_path: str) -> list:
 
 
 def chunk_text_data(content_list, split_to_length: int = 200):
-    """优化后的核心分块逻辑：支持深度拆分超长字符串，按标点断句组装"""
+    """优化后的核心分块逻辑：支持深度拆分超长字符串，按标点断句组装，且带有无标点强制截断"""
     if not content_list:
         return []
 
@@ -437,7 +456,6 @@ def chunk_text_data(content_list, split_to_length: int = 200):
     last_type = ""
 
     # 🌟 核心改进 1：定义通用分句正则，支持中英文句号、感叹号、问号和换行符
-    # 使用 () 捕获组可以保留分隔符本身，不会在 split 时丢失标点
     sentence_pattern = r'([。！？!\?\n]+)'
 
     for con in require_items:
@@ -448,7 +466,7 @@ def chunk_text_data(content_list, split_to_length: int = 200):
         current_bbox = con.get("bbox", [])
         item_type = con.get("type")
 
-        # 🌟 核心改进 2：强制将传入的文本（即使是几千字的整块）按标点打碎成句子列表
+        # 🌟 核心改进 2：强制将传入的文本按标点打碎成句子列表
         pieces = re.split(sentence_pattern, t)
         sentences = []
 
@@ -464,7 +482,31 @@ def chunk_text_data(content_list, split_to_length: int = 200):
         if not sentences:
             sentences = [t]
 
-        # 🌟 核心改进 3：遍历打碎后的短句，根据长度上限(split_to_length)重新组装
+        # =====================================================================
+        # 🚀 新增托底逻辑：防止“没有标点的超长句子”导致超出 split_to_length
+        # =====================================================================
+        refined_sentences = []
+        for sentence in sentences:
+            while len(sentence) > split_to_length:
+                # 优先尝试在截断范围内寻找最后一个空格，防止把英文单词从中间切断
+                split_idx = sentence.rfind(' ', 0, split_to_length)
+
+                # 如果找不到空格，或者空格太靠前（比如全是中文没有空格），就直接强制按长度硬切
+                if split_idx == -1 or split_idx < (split_to_length * 0.5):
+                    split_idx = split_to_length
+
+                refined_sentences.append(sentence[:split_idx])
+                # 剩余部分去掉开头的空白字符继续循环
+                sentence = sentence[split_idx:].lstrip()
+
+            if sentence:
+                refined_sentences.append(sentence)
+
+        # 替换为处理后的安全短句列表
+        sentences = refined_sentences
+        # =====================================================================
+
+        # 🌟 核心改进 3：遍历打碎后的短句，根据长度上限重新组装
         for sentence in sentences:
             if (len(current_text) + len(sentence) > split_to_length) and len(current_text) > 0 and last_type != "title":
                 # 保存上一个块
@@ -502,8 +544,7 @@ def chunk_text_data(content_list, split_to_length: int = 200):
     # 6. 构造最终返回的数据格式
     final_res_list = []
     for index, block in enumerate(new_block_list):
-        # 🌟 新增：在这里统一把文本中的 \n 清除掉
-        # 使用 replace('\n', '') 去除换行符，如果是中英文混排怕粘连，也可以换成 replace('\n', ' ')
+        # 统一把文本中的 \n 清除掉
         clean_text = block["text"].replace('\n', '').strip()
 
         final_res_list.append({
@@ -533,10 +574,12 @@ def convert_office_to_pdf_sync(docx_path: str, output_dir: str):
         raise Exception("找不到 soffice 命令，请确保服务器安装了 LibreOffice 并配置了环境变量")
 
 
-def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str = None, type: str = 'pdf',
-                                 user_id: str = '', file_id: int = 0):
+
+
+
+def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str = None, type: str = 'pdf', user_id: str = '', file_id: int = 0):
     """
-    遍历分块数据，调用 Embedding 接口，批量写入 Milvus。
+    优化后：并发获取向量 + 分批写入 Milvus + 失败自动回滚(模拟事务)
     """
     if batch_id is None:
         batch_id = task_id
@@ -544,66 +587,101 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
         return {"status": "error", "msg": "没有有效的分块数据可供插入"}
 
     filtered_count = 0
+    valid_tasks = []  # 存储需要获取向量的有效文本块
+
+    # ================= 1. 文本过滤与数据准备 =================
+    for index, item in enumerate(chunked_data):
+        text = item.get("text", "").strip()
+        if not text:
+            return {"status": "error", "msg": f"解析失败：分块 {index} 文本为空"}
+        if type == 'pdf' and len(text) > 600:
+            continue
+        if is_garbage_text(text):
+            filtered_count += 1
+            continue
+
+        doc_id = f"{task_id}_{index}"
+        valid_tasks.append({
+            "index": index,
+            "id": doc_id,
+            "text": text
+        })
+
+    if not valid_tasks:
+        return {"status": "error", "msg": "解析失败：文本内容过短(小于50字)或全为无效乱码，无有效数据入库"}
+
+    # ================= 2. 并发获取向量 (解决速度极慢的问题) =================
+    to_insert_batch = []
     valid_embeddings = []
     valid_texts = []
     valid_metadata = []
 
-    # 批量入库的数组
-    to_insert_batch = []
+    # 抽取单次获取向量的逻辑，供线程池调用
+    def fetch_vector_for_item(task: dict):
+        try:
+            vec = vector_4b(task["text"])
+            if not vec or not isinstance(vec, list) or len(vec) == 0:
+                raise Exception("获取向量为空或无效")
+            return {"success": True, "task": task, "vector": vec}
+        except Exception as e:
+            return {"success": False, "task": task, "error": str(e)}
+
+    print(f"[{task_id}] 开始并发获取 {len(valid_tasks)} 个分块的向量...")
+    # 使用线程池并发请求大模型向量接口（max_workers可根据你的API并发上限调整，例如10）
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(fetch_vector_for_item, valid_tasks))
+
+    # 检查并发结果并组装入库数据
+    for res in results:
+        if not res["success"]:
+            # 如果有任何一个块获取向量失败，触发“严控条件”，直接判定失败并返回
+            err_msg = res.get("error", "未知错误")
+            idx = res["task"]["index"]
+            return {"status": "error", "msg": f"解析失败：分块 {idx} 获取向量报错: {err_msg}"}
+
+        task = res["task"]
+        vec = res["vector"]
+
+        to_insert_batch.append({
+            "id": task["id"],
+            "vector": vec,
+            "batch_id": batch_id,
+            "text": task["text"],
+            "date": str(int(time.time())),
+            "user_id": user_id,
+            "file_id": file_id,
+        })
+        valid_embeddings.append(vec)
+        valid_texts.append(task["text"])
+        valid_metadata.append(f"来源文件ID: {file_id}")
+
+    # ================= 3. 分批安全入库与手动回滚 (保证事务性) =================
+    # 每次向 Milvus 写入的条数，建议 500-1000 条，防止单次请求 Payload 过大(>64MB)
+    MILVUS_INSERT_BATCH_SIZE = 500
 
     try:
-        for index, item in enumerate(chunked_data):
-            text = item.get("text", "").strip()
+        print(f"[{task_id}] 向量获取完毕，准备向 Milvus 写入 {len(to_insert_batch)} 条数据...")
 
-            # 🌟 严控条件 1：如果切块文本为空，直接判定为解析失败
-            if not text:
-                return {"status": "error", "msg": f"解析失败：分块 {index} 文本为空"}
-
-            if type == 'pdf':
-                if len(text) > 600:
-                    continue
-
-            # （保留原有逻辑）如果是乱码或过短，先跳过，由循环结束后的 to_insert_batch 兜底判断
-            if is_garbage_text(text):
-                filtered_count += 1
-                continue
-
-            try:
-                embeddings_list = vector_4b(text)
-            except Exception as e:
-                # 🌟 严控条件 2：Embedding 报错，直接判定为解析失败
-                return {"status": "error", "msg": f"解析失败：分块 {index} 请求 Embedding API 报错: {str(e)}"}
-
-            if not embeddings_list or not isinstance(embeddings_list, list) or len(embeddings_list) == 0:
-                # 🌟 严控条件 3：向量获取为空或无效，直接判定为解析失败
-                return {"status": "error", "msg": f"解析失败：分块 {index} 获取向量为空或无效"}
-
-            doc_id = f"{task_id}_{index}"
-
-            to_insert_batch.append({
-                "id": doc_id,
-                "vector": embeddings_list,
-                "batch_id": batch_id,
-                "text": text,
-                "date": str(int(time.time())),
-                "user_id": user_id,
-                "file_id": file_id,
-            })
-
-            valid_embeddings.append(embeddings_list)
-            valid_texts.append(text)
-            valid_metadata.append(f"来源文件ID: {file_id}")
-
-            # 如果全是乱码被过滤，导致没有有效数据，返回 error
-        if not to_insert_batch:
-            return {"status": "error", "msg": "解析失败：文本内容过短(小于50字)或全为无效乱码，无有效数据入库"}
-
-        # 执行统一批量插入
-        milvus_client.insert(collection_name=MILVUS_COLLECTION_MAIN, data=to_insert_batch)
+        for i in range(0, len(to_insert_batch), MILVUS_INSERT_BATCH_SIZE):
+            batch_data = to_insert_batch[i: i + MILVUS_INSERT_BATCH_SIZE]
+            milvus_client.insert(collection_name=MILVUS_COLLECTION_MAIN, data=batch_data)
 
     except Exception as e:
-        return {"status": "error", "msg": f"Milvus 入库失败: {str(e)}"}
+        print(f"[{task_id}] 写入 Milvus 时发生错误: {str(e)}，正在执行回滚...")
+        # ⚠️ 手动回滚：利用 batch_id 将本次可能已经写入成功的部分数据全部删除
+        try:
+            # 确保 collection 中 batch_id 是可作为标量过滤条件的字段
+            milvus_client.delete(
+                collection_name=MILVUS_COLLECTION_MAIN,
+                filter=f"batch_id == '{batch_id}'"
+            )
+            print(f"[{task_id}] 回滚成功，已清除残留数据。")
+        except Exception as rollback_err:
+            print(f"[{task_id}] 致命错误，回滚失败: {str(rollback_err)}")
 
+        return {"status": "error", "msg": f"Milvus 入库失败，已执行回滚: {str(e)}"}
+
+    # ================= 4. 成功返回 =================
     return {
         "status": "success",
         "filtered_count": filtered_count,
@@ -845,7 +923,11 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             chunked_data  = chunk_text_data(
                 [{"type": "text", "text": text_content}], split_to_length=200
             )
-            db_result = process_and_insert_to_milvus(
+            print()
+            print("识别txt文件内容")
+            print(chunked_data)
+
+            db_result = await async_process_and_insert_to_milvus(
                 task_id, chunked_data, batch_id=batch_id, type='txt',
                 user_id=user_id, file_id=file_id
             )
@@ -900,7 +982,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 print(chunked_data)
                 print()
                 # 4. 入库
-                db_result = process_and_insert_to_milvus(
+                db_result = await async_process_and_insert_to_milvus(
                     task_id, chunked_data, batch_id=batch_id, type='word',
                     user_id=user_id, file_id=file_id
                 )
@@ -1001,7 +1083,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             print(chunked_data)
             print()
             # 入库，type 标记为 'image'
-            db_result = process_and_insert_to_milvus(
+            db_result = await async_process_and_insert_to_milvus(
                 task_id, chunked_data, batch_id=batch_id, type='image',
                 user_id=user_id, file_id=file_id
             )
@@ -1079,7 +1161,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                     [{"type": "text", "text": xmind_str}], split_to_length=200
                 )
                 print(chunked_data)
-                db_result = process_and_insert_to_milvus(
+                db_result = await async_process_and_insert_to_milvus(
                     task_id, chunked_data, batch_id=batch_id, type='xmind',
                     user_id=user_id, file_id=file_id
                 )
@@ -1105,7 +1187,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 print()
                 # 3. 向量化并入库（共用 batch_id）
                 print(f"[批次 {batch_id}] 任务 {task_id} 开始入库...")
-                db_result = process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_id=file_id)
+                db_result = await async_process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_id=file_id)
 
         # --- 判定 Milvus 入库结果 ---
         if isinstance(db_result, dict) and db_result.get("status") == "success":
