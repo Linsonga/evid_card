@@ -1017,10 +1017,10 @@ def matching_zone(titles, batch_id, matcher, pipeline, materials, allowed_topic_
 
         # 🌟 改动：同时接收 topic_id 和 topic_name
         topic_id, topic_name = matcher.cardDistribution(title_vec, title, threshold=0.35, allowed_topic_ids=allowed_topic_ids)
-        # topic_id = 438
-        # title = '注射吸毒传播乙肝防控'
+
+        # topic_id = 388
+        # title = '舌紫暗苔黄腻用药加减策略'
         # info = query_and_audit(topic_id, title, batch_id, pipeline, materials, topic_name)
-        #
         # exit()
 
         if topic_id:
@@ -1420,63 +1420,63 @@ def file_create_card_async(
         max_workers: Optional[int] = Query(None, description="自定义最大并发线程数") # 🌟 新增前端传参
 ):
 
-    topic_id = 388
-    title = '舌紫暗苔黄腻用药加减策略'
-    info = query_and_audit(topic_id, title, batch_id, global_pipeline, "", "辅助生殖居家注射针头处置风险与延伸护理")
+    # topic_id = 388
+    # title = '舌紫暗苔黄腻用药加减策略'
+    # info = query_and_audit(topic_id, title, batch_id, global_pipeline, "", "辅助生殖居家注射针头处置风险与延伸护理")
 
-    #
-    # # ==========================================
-    # # 🌟 新增：动态判断并发数逻辑
-    # # ==========================================
-    # if max_workers is not None:
-    #     final_workers = max_workers
-    # elif allowed_topic_ids is not None:
-    #     final_workers = 3
-    # elif batch_id is not None:
-    #     final_workers = 1
-    # else:
-    #     final_workers = 1  # 兜底默认值
-    #
-    # """前端触发接口：兼容单文件与全库挖掘"""
-    # # ==========================================
-    # # 分支 1：如果是断点续传（传了 task_id）
-    # # ==========================================
-    # if task_id:
-    #     existing_state = read_task_state(task_id)
-    #     if not existing_state:
-    #         return JSONResponse(content={"code": 404, "msg": "未找到指定的历史任务文件，无法续传"})
-    #
-    #     # 修改这里：如果状态是 running，但用户传了 force=true，就强制接管
-    #     if existing_state.get("status") == "running" and not force:
-    #         return JSONResponse(
-    #             content={"code": 400, "msg": "该挖掘任务正在后台运行中。如果确定是死任务，请传递 &force=true 强制续传"})
-    #
-    #     update_task_state(task_id, {
-    #         "status": "running",
-    #         "msg": "后台断点续传任务已恢复..."
-    #     })
-    #
-    #     background_tasks.add_task(continuous_mining_worker, task_id, None, allowed_topic_ids, final_workers)
-    #     return JSONResponse(content={
-    #         "code": 200,
-    #         "msg": "后台断点续传任务已成功启动",
-    #         "task_id": task_id
-    #     })
-    #
-    # if batch_id:
-    #     task_id = f"batch_{batch_id}"
-    # else:
-    #     # 没传 batch_id，开启全库漫游任务
-    #     task_id = f"global_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
-    #
-    # existing_state = read_task_state(task_id)
-    # if existing_state and existing_state.get("status") == "running":
-    #     return JSONResponse(content={"code": 400, "msg": "该挖掘任务正在后台运行中，请勿重复提交"})
-    #
-    # init_task_state(task_id)
-    #
-    # # 丢入后台执行
-    # background_tasks.add_task(continuous_mining_worker, task_id, batch_id, allowed_topic_ids, final_workers)
+
+    # ==========================================
+    # 🌟 新增：动态判断并发数逻辑
+    # ==========================================
+    if max_workers is not None:
+        final_workers = max_workers
+    elif allowed_topic_ids is not None:
+        final_workers = 3
+    elif batch_id is not None:
+        final_workers = 1
+    else:
+        final_workers = 1  # 兜底默认值
+
+    """前端触发接口：兼容单文件与全库挖掘"""
+    # ==========================================
+    # 分支 1：如果是断点续传（传了 task_id）
+    # ==========================================
+    if task_id:
+        existing_state = read_task_state(task_id)
+        if not existing_state:
+            return JSONResponse(content={"code": 404, "msg": "未找到指定的历史任务文件，无法续传"})
+
+        # 修改这里：如果状态是 running，但用户传了 force=true，就强制接管
+        if existing_state.get("status") == "running" and not force:
+            return JSONResponse(
+                content={"code": 400, "msg": "该挖掘任务正在后台运行中。如果确定是死任务，请传递 &force=true 强制续传"})
+
+        update_task_state(task_id, {
+            "status": "running",
+            "msg": "后台断点续传任务已恢复..."
+        })
+
+        background_tasks.add_task(continuous_mining_worker, task_id, None, allowed_topic_ids, final_workers)
+        return JSONResponse(content={
+            "code": 200,
+            "msg": "后台断点续传任务已成功启动",
+            "task_id": task_id
+        })
+
+    if batch_id:
+        task_id = f"batch_{batch_id}"
+    else:
+        # 没传 batch_id，开启全库漫游任务
+        task_id = f"global_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+
+    existing_state = read_task_state(task_id)
+    if existing_state and existing_state.get("status") == "running":
+        return JSONResponse(content={"code": 400, "msg": "该挖掘任务正在后台运行中，请勿重复提交"})
+
+    init_task_state(task_id)
+
+    # 丢入后台执行
+    background_tasks.add_task(continuous_mining_worker, task_id, batch_id, allowed_topic_ids, final_workers)
 
     return JSONResponse(content={
         "code": 200,

@@ -485,24 +485,33 @@ class AgenticPipeline:
 
     def retrieve_local_memories(self, zone_name):
         """
-        【渐进式检索】：只拿取“通用”规则以及“当前特定专区”的规则，避免上下文稀释。
+        【渐进式检索】：只拿取“通用”规则以及“当前特定专区”的规则，加入数量限制防止 Token 撑爆！
         """
         local_rules = []
         tree = self.registry.get("memory_tree", {})
 
         for error_type, zone_dict in tree.items():
             if "通用" in zone_dict:
-                local_rules.extend(zone_dict["通用"])
+                # 🌟 修改点：只取最后（最新）进化的 10 条通用规则
+                local_rules.extend(zone_dict["通用"][-10:])
             if zone_name and zone_name in zone_dict:
-                local_rules.extend(zone_dict[zone_name])
-        # 去重并返回
-        return list(set(local_rules))
+                # 🌟 修改点：只取最后（最新）进化的 10 条专区专属规则
+                local_rules.extend(zone_dict[zone_name][-10:])
+
+        # 去重
+        unique_rules = list(set(local_rules))
+
+        # 🌟 终极防爆锁：不管怎样，最多只返回最后 20 条避坑指南
+        return unique_rules[-20:]
 
     def check_local_rules(self, title, info, local_rules):
         """
         利用大模型一次性检查当前文本是否违背了本专区的任何一条避坑指南
         """
-        rules_str = "\n".join([f"{i + 1}. {r}" for i, r in enumerate(local_rules)])
+        # 🌟 双重保险：强制切片，最多只允许 20 条规则参与拼装
+        safe_rules = local_rules[:20]
+        rules_str = "\n".join([f"{i + 1}. {r}" for i, r in enumerate(safe_rules)])
+
         sys_prompt = "你是顶级医学文本质检官。请判断目标结论是否违反了给定的【专属避坑规则】中的任意一条。"
         user_prompt = f"""
         文章标题: {title}
@@ -789,8 +798,10 @@ class AgenticPipeline:
             retry_count = 0
             is_passed = False
 
+            # 保留原始 JSON，供后续提取参考文献使用
+            original_raw_info = item.get("info", "")
             # 使用副本进行内部处理
-            current_info = self.cleaningInfo(item.get("info", ""))
+            current_info = self.cleaningInfo(original_raw_info)
 
             # ======= 进入 反思抢救循环 =======
             while retry_count <= MAX_RETRIES:
@@ -833,6 +844,7 @@ class AgenticPipeline:
                     item["score"] = score
                     item["score_reason"] = score_reason
                     item["info"] = current_info  # 保存最终成果
+                    item["_raw_info"] = original_raw_info  # 保留原始 JSON 用于提取参考文献
                     break
                 else:
                     print(f"❌ 审核失败。发现 {len(feedback_reasons)} 个问题。")
@@ -877,6 +889,7 @@ class AgenticPipeline:
             for item in passed_data:
                 pass_title = item["title"]
                 pass_info = item["info"]
+                raw_info = item.get("_raw_info", "")  # 原始 JSON，用于提取参考文献
 
                 if batch_id and item.get("id"):
                     # 🌟 修改点 2：批次 ID 更新
@@ -895,21 +908,29 @@ class AgenticPipeline:
                 # 向量库中查询的数据
                 materials = f"\n{materials}" if materials else ""
                 # mysql查询的数据
-                references_text = build_materials_and_references(pass_info) if pass_info else ""
+                references_text = build_materials_and_references(raw_info) if raw_info else ""
 
                 # ================= 修复部分开始 =================
-                # 安全提取 pass_info 中的 reference，并转为纯文本以节省 Token
+                # 安全提取 raw_info 中的 reference，并转为纯文本以节省 Token
                 extracted_refs = ""
-                if pass_info:
-                    # 1. 如果是字符串，先解析为字典
-                    parsed_info = json.loads(pass_info) if isinstance(pass_info, str) else pass_info
-                    # 2. 提取 reference 数组
-                    refs_list = parsed_info.get("reference", [])
-                    # 3. 将数组转回 JSON 字符串，确保大模型能读懂且不乱码
-                    extracted_refs = json.dumps(refs_list, ensure_ascii=False)
+                if raw_info:
+                    try:
+                        # 1. 如果是字符串，先解析为字典
+                        parsed_info = json.loads(raw_info) if isinstance(raw_info, str) else raw_info
+                        # 2. 提取 reference 数组
+                        refs_list = parsed_info.get("reference", [])
+                        # 3. 将数组转回 JSON 字符串，确保大模型能读懂且不乱码
+                        extracted_refs = json.dumps(refs_list, ensure_ascii=False)
+                    except (json.JSONDecodeError, AttributeError) as e:
+                        logger.warning(f"提取参考文献失败，原始 info 非标准 JSON: {e}")
                 # ================= 修复部分结束 =================
 
                 print(materials)
+                print()
+
+                print()
+                print(extracted_refs)
+                print(len(extracted_refs))
                 print()
 
                 system_prompt = '你现在是医学证据卡片选题总编和临床知识编辑'
@@ -926,7 +947,7 @@ class AgenticPipeline:
                 一、必须使用的资料范围与使用原则
                 你必须优先并显式整合以下来源，但当上传材料与外部证据不一致时，必须明确区分“医生经验逻辑”“资料原文观点”“外部循证结论”，不能混写。不得只根据我上传的一份资料直接成文，必须交叉验证。
                 我已将资料筛选出精华片段，如下：
-                {extracted_refs}
+                {extracted_refs}{materials}
 
                 1. 决策树/思维导图：提取风险因素分层、症状识别路径、辅助检查路径、证候判定条件、治法选择逻辑、对症加减规则。这决定“临床推理顺序”，不是单纯摘抄内容。
                 2. 医案与书籍：提取核心病机、主要/兼夹病机、理法方药对应、加减思路、剂量逻辑、动态调整、误治漏治转折点。这决定“为什么这样治”，不是只提方名药名。
