@@ -333,14 +333,134 @@ def clean_markdown_for_wechat(md_text: str) -> str:
 
 
 
+def format_wechat_nested_list(md_text: str) -> str:
+    """
+    只处理嵌套列表块，不破坏正文
+    """
+
+    lines = md_text.split("\n")
+    new_lines = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # 判断是否是列表块开始
+        if re.match(r'^\s*\*\s+', line):
+            block = []
+
+            # 收集连续的 * 列表
+            while i < len(lines) and re.match(r'^\s*\*\s+', lines[i]):
+                block.append(lines[i])
+                i += 1
+
+            # 处理这个 block
+            new_lines.extend(process_list_block(block))
+        else:
+            new_lines.append(line)
+            i += 1
+
+    return "\n".join(new_lines)
+
+
+
+def process_list_block(block_lines):
+    result = []
+
+    for line in block_lines:
+        indent = len(line) - len(line.lstrip(' '))
+        level = indent // 4
+
+        content = re.sub(r'^\s*\*\s*', '', line).strip()
+
+        # 识别 **标题：**
+        match = re.match(r'\*\*(.*?)\*\*[:：]?\s*(.*)', content)
+
+        if match:
+            title = match.group(1).rstrip('：:')  # ✅ 防止 ：：
+            rest = match.group(2)
+
+            html = f'''
+            <p style="
+                margin-left:{level}em;
+                line-height:1.75em;
+                font-size:15px;
+                color:#333;
+            ">
+                <strong style="color:#d32f2f;">{title}：</strong>{rest}
+            </p>
+            '''.strip()
+
+        else:
+            html = f'''
+            <p style="margin-left:{level}em; line-height:1.75em;">
+                {content}
+            </p>
+            '''.strip()
+
+        result.append(html)
+
+    return result
+
+
+
+def format_wechat_references(md_text: str) -> str:
+    if not md_text:
+        return ""
+
+    # 1. 清理特殊空格
+    md_text = md_text.replace('\xa0', ' ')
+
+    # 2. 去掉 --- 分隔符
+    md_text = re.sub(
+        r'[-—－]{2,}\s*(\*{0,2}参考文献\*{0,2})',
+        r'\1',
+        md_text
+    )
+
+    # 3. 在“参考文献”后面强制加 <br>
+    md_text = re.sub(
+        r'(\*{0,2}参考文献\*{0,2})',
+        r'\1<br>',
+        md_text
+    )
+
+    # 4. 拆分正文和参考文献部分
+    parts = re.split(r'(\*{0,2}参考文献\*{0,2}<br>)', md_text)
+
+    if len(parts) >= 3:
+        ref_body = parts[-1].strip()
+
+        # 5. 给每个 [n] 前加换行（除了第一个）
+        formatted_ref_body = re.sub(
+            r'(?<!^)\s*(\[|［|【)\s*(\d+)\s*(\]|］|】)',
+            r'<br>[\2] ',
+            ref_body
+        )
+
+        # 6. 清理开头可能多余的 <br>
+        formatted_ref_body = re.sub(r'^<br>', '', formatted_ref_body)
+
+        parts[-1] = formatted_ref_body
+        md_text = "".join(parts)
+
+    return md_text
+
+
+def remove_fragments(text: str) -> str:
+    """
+    删除类似 [片段 1] / [片段 1-3] / [片段 2,3] 的标记
+    """
+    pattern = r'\[片段\s*\d+(?:[-,]\d+)*\]'
+    return re.sub(pattern, '', text)
 
 
 def main():
     # --- 配置项 ---
     md_dir = "card_md"
     test_mode = True  # 设置为 True 则只选取较少数量测试
-    batch_size = 6
-    draft_mode = False  # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
+    batch_size = 1
+    draft_mode = True  # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
     # --------------
 
     if not os.path.exists(md_dir):
@@ -403,7 +523,16 @@ def main():
             # )
 
             # 调用公共方法
-            content = clean_markdown_for_wechat(content)
+            # content = clean_markdown_for_wechat(content)
+            # 删除类似 [片段 1] / [片段 1-3] / [片段 2,3] 的标记
+            content = remove_fragments(content)
+
+            # 参考文献
+            content = format_wechat_references(content)
+
+            # 层级效果
+            content = format_wechat_nested_list(content)
+
             content = re.sub(r'^#\s+.*(?:\r?\n|$)', '', content, count=1).strip()
 
             print(f"正在为生成 AI 封面...")
