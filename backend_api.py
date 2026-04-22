@@ -1311,8 +1311,8 @@ def mock_db_execute_update(files: List[FileCallbackItem]):
 
 # ================= 🌟 新增：手动触发生成卡片的请求模型 =================
 class GenerateTitlesRequest(BaseModel):
-    file_id: int = Field(..., description="要生成卡片的文件ID")
-    user_id: int = Field(..., description="所属用户ID")
+    id: int = Field(..., description="要生成卡片的文件ID")
+    user_id: str = Field(..., description="所属用户ID")
 
 
 # ================= 🌟 新增：从向量库查询并生成卡片的后台任务 =================
@@ -1625,21 +1625,22 @@ async def generate_titles_endpoint(
     提供给前端/业务端的独立接口：
     传入 file_id 和 user_id，系统会从 Milvus 中提取该文件的数据，并生成 10 个卡片标题入库。
     """
-    if req.file_id <= 0:
+    if req.id <= 0:
         raise HTTPException(status_code=400, detail="非法的 file_id")
 
     # 加入后台异步任务，避免 HTTP 请求超时
     background_tasks.add_task(
         background_generate_titles,
-        req.file_id,
+        req.id,
         req.user_id
     )
 
     return JSONResponse(content={
         "code": 200,
-        "msg": f"已成功将文件ID [{req.file_id}] 的卡片生成任务加入后台队列，稍后可在数据库查看生成结果"
+        "msg": f"已成功将文件ID [{req.id}] 的卡片生成任务加入后台队列，稍后可在数据库查看生成结果"
     })
 
 
 if __name__ == "__main__":
+    # final_port = int(PORT)
     uvicorn.run(app, host="0.0.0.0", port=5911, workers=1)

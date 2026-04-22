@@ -731,21 +731,16 @@ async def get_task_result( task_id: str, chunk: bool = Query(False, description=
 # 增加 zone_name 参数
 def query_and_audit(topic_id, title, batch_id, pipeline, materials, zone_name):
     """【封装方法】：制卡成功后，查库组装数据并触发 RL 审核"""
-    # conn = pymysql.connect(**DB_CONFIG)
-    # cursor = conn.cursor(pymysql.cursors.DictCursor)
-    # cursor.execute("SELECT id, title, info, core_conclusion FROM evidence_card WHERE topic_id = %s and title = %s", (topic_id, title))
-    # results = cursor.fetchall()
-    # cursor.close()
-    # conn.close()
-    # 🌟 修改点：从连接池获取连接
     conn = get_db_connection()
     cursor = conn.cursor(pymysql.cursors.DictCursor)
     try:
-        cursor.execute("SELECT id, title, info, core_conclusion FROM evidence_card WHERE topic_id = %s and title = %s",
-                       (topic_id, title))
-        results = cursor.fetchall()
+        # 🌟 修改点：加上 ORDER BY id DESC LIMIT 1，只取最新生成的这 1 张卡片
+        cursor.execute(
+            "SELECT id, title, info, core_conclusion FROM evidence_card WHERE topic_id = %s and title = %s ORDER BY id DESC LIMIT 1",
+            (topic_id, title)
+        )
+        results = cursor.fetchall()  # 这里 results 必定最多只有 1 条数据了
     finally:
-        # 🌟 修改点：使用 try-finally 确保连接一定会归还给连接池
         cursor.close()
         conn.close()
 
@@ -759,7 +754,6 @@ def query_and_audit(topic_id, title, batch_id, pipeline, materials, zone_name):
         })
 
     if dummy_input_data:
-        # 🌟 改动：将 zone_name 传给 run_round
         pipeline.run_round(dummy_input_data, title, batch_id, materials, zone_name)
     else:
         logger.warning("- 数据库中未查询到记录。")
@@ -773,6 +767,7 @@ def callingCard(topic_id, card_title):
     try:
         resp = requests.get(url, timeout=(30, 18000))
         if resp.status_code == 200:
+            print(resp)
             print(f"制卡成功: {card_title}")
             return True
         print()
@@ -1022,9 +1017,10 @@ def matching_zone(titles, batch_id, matcher, pipeline, materials, allowed_topic_
 
         # 🌟 改动：同时接收 topic_id 和 topic_name
         topic_id, topic_name = matcher.cardDistribution(title_vec, title, threshold=0.35, allowed_topic_ids=allowed_topic_ids)
-        # topic_id = 353
-        # title = '胃凉遇冷腹泻温通法则'
+        # topic_id = 438
+        # title = '注射吸毒传播乙肝防控'
         # info = query_and_audit(topic_id, title, batch_id, pipeline, materials, topic_name)
+        #
         # exit()
 
         if topic_id:
@@ -1423,58 +1419,64 @@ def file_create_card_async(
         allowed_topic_ids: Optional[List[int]] = Query(None, description="指定只匹配的专区ID列表，不传则全库匹配"),
         max_workers: Optional[int] = Query(None, description="自定义最大并发线程数") # 🌟 新增前端传参
 ):
-    # ==========================================
-    # 🌟 新增：动态判断并发数逻辑
-    # ==========================================
-    if max_workers is not None:
-        final_workers = max_workers
-    elif allowed_topic_ids is not None:
-        final_workers = 3
-    elif batch_id is not None:
-        final_workers = 1
-    else:
-        final_workers = 1  # 兜底默认值
 
-    """前端触发接口：兼容单文件与全库挖掘"""
-    # ==========================================
-    # 分支 1：如果是断点续传（传了 task_id）
-    # ==========================================
-    if task_id:
-        existing_state = read_task_state(task_id)
-        if not existing_state:
-            return JSONResponse(content={"code": 404, "msg": "未找到指定的历史任务文件，无法续传"})
+    topic_id = 388
+    title = '舌紫暗苔黄腻用药加减策略'
+    info = query_and_audit(topic_id, title, batch_id, global_pipeline, "", "辅助生殖居家注射针头处置风险与延伸护理")
 
-        # 修改这里：如果状态是 running，但用户传了 force=true，就强制接管
-        if existing_state.get("status") == "running" and not force:
-            return JSONResponse(
-                content={"code": 400, "msg": "该挖掘任务正在后台运行中。如果确定是死任务，请传递 &force=true 强制续传"})
-
-        update_task_state(task_id, {
-            "status": "running",
-            "msg": "后台断点续传任务已恢复..."
-        })
-
-        background_tasks.add_task(continuous_mining_worker, task_id, None, allowed_topic_ids, final_workers)
-        return JSONResponse(content={
-            "code": 200,
-            "msg": "后台断点续传任务已成功启动",
-            "task_id": task_id
-        })
-
-    if batch_id:
-        task_id = f"batch_{batch_id}"
-    else:
-        # 没传 batch_id，开启全库漫游任务
-        task_id = f"global_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
-
-    existing_state = read_task_state(task_id)
-    if existing_state and existing_state.get("status") == "running":
-        return JSONResponse(content={"code": 400, "msg": "该挖掘任务正在后台运行中，请勿重复提交"})
-
-    init_task_state(task_id)
-
-    # 丢入后台执行
-    background_tasks.add_task(continuous_mining_worker, task_id, batch_id, allowed_topic_ids, final_workers)
+    #
+    # # ==========================================
+    # # 🌟 新增：动态判断并发数逻辑
+    # # ==========================================
+    # if max_workers is not None:
+    #     final_workers = max_workers
+    # elif allowed_topic_ids is not None:
+    #     final_workers = 3
+    # elif batch_id is not None:
+    #     final_workers = 1
+    # else:
+    #     final_workers = 1  # 兜底默认值
+    #
+    # """前端触发接口：兼容单文件与全库挖掘"""
+    # # ==========================================
+    # # 分支 1：如果是断点续传（传了 task_id）
+    # # ==========================================
+    # if task_id:
+    #     existing_state = read_task_state(task_id)
+    #     if not existing_state:
+    #         return JSONResponse(content={"code": 404, "msg": "未找到指定的历史任务文件，无法续传"})
+    #
+    #     # 修改这里：如果状态是 running，但用户传了 force=true，就强制接管
+    #     if existing_state.get("status") == "running" and not force:
+    #         return JSONResponse(
+    #             content={"code": 400, "msg": "该挖掘任务正在后台运行中。如果确定是死任务，请传递 &force=true 强制续传"})
+    #
+    #     update_task_state(task_id, {
+    #         "status": "running",
+    #         "msg": "后台断点续传任务已恢复..."
+    #     })
+    #
+    #     background_tasks.add_task(continuous_mining_worker, task_id, None, allowed_topic_ids, final_workers)
+    #     return JSONResponse(content={
+    #         "code": 200,
+    #         "msg": "后台断点续传任务已成功启动",
+    #         "task_id": task_id
+    #     })
+    #
+    # if batch_id:
+    #     task_id = f"batch_{batch_id}"
+    # else:
+    #     # 没传 batch_id，开启全库漫游任务
+    #     task_id = f"global_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+    #
+    # existing_state = read_task_state(task_id)
+    # if existing_state and existing_state.get("status") == "running":
+    #     return JSONResponse(content={"code": 400, "msg": "该挖掘任务正在后台运行中，请勿重复提交"})
+    #
+    # init_task_state(task_id)
+    #
+    # # 丢入后台执行
+    # background_tasks.add_task(continuous_mining_worker, task_id, batch_id, allowed_topic_ids, final_workers)
 
     return JSONResponse(content={
         "code": 200,
@@ -1589,7 +1591,7 @@ def _mine_data_batch(task_id: str, target_batch_id: str, embeddings: np.ndarray,
     if num_chunks == 0:
         return
 
-    N_CLUSTERS = max(1, num_chunks // 5)
+    N_CLUSTERS = max(1, num_chunks // 2)
     update_task_state(task_id, {
         "msg": f"[进度: 库内已阅 {total_processed} 条] 本批次划分为 {N_CLUSTERS} 个矿区准备挖掘。",
         "stats": {"total_clusters": N_CLUSTERS}
@@ -1628,12 +1630,15 @@ def _mine_data_batch(task_id: str, target_batch_id: str, embeddings: np.ndarray,
         })
 
         current_materials_str = ""
-        for rank, item in enumerate(items[:20]):
+        for rank, item in enumerate(items[:5]):
             current_materials_str += f"片段{rank + 1} [{item['source']}]: {item['text']}\n"
 
+        print()
+        print(current_materials_str)
+        print()
         history_str = "\n".join(history_topics) if history_topics else "无"
 
-        system_prompt = '你现在是“医学证据卡片选题总编 + 临床知识编辑 + 循证医学研究员 + 医生知识资产工程师”。'
+        system_prompt = '你现在是医学证据卡片选题总编 + 临床知识编辑 + 循证医学研究员 + 医生知识资产工程师。'
         # 保留您原有的业务要求，但在最前面加上极其严厉的“黑名单”规则
         dynamic_user_prompt = f"""
         【历史选题黑名单】（绝对禁止重复以下方向或题目）：
@@ -1697,6 +1702,7 @@ def _mine_data_batch(task_id: str, target_batch_id: str, embeddings: np.ndarray,
         1. 每个卡片标题的字数必须严格控制在 10 到 15 个字之间！
         2. 剔除所有不必要的连接词、助词和冗长的状语，提炼核心医学实体。
         3. 严禁使用提问式的长复句。
+        4. 【去个人化绝对红线】：绝对禁止在标题中出现任何专家、医生、学者、古人的具体姓名或称谓（如“王教授”、“张医生”、“李氏”、“名老中医”等）。必须将个人经验转化为客观、通用的学术/临床规律表述。
         【错误示范（35字）】：肝硬化腹水患者体位变化对心输出量和血管阻力的影响是否影响利尿剂使用时机
         【正确示范（13字）】：肝硬化腹水体位与利尿剂时机
         【错误示范（22字）】：幽门螺杆菌根除后针对不同病理类型的随访策略
@@ -1709,9 +1715,10 @@ def _mine_data_batch(task_id: str, target_batch_id: str, embeddings: np.ndarray,
         1. 输出 10 个证据卡片候选选题。
         2. 绝对禁止出现任何中文或英文标点符号。
         3. 严格遵守 10-15 字的字数限制。
-        4. 请仔细对比【历史选题黑名单】，主动拉开差异。
-        5. 🌟 为每个卡片标题生成一个简短的原因说明（主要解释为什么从临床决策角度提取这个标题）。
-        6. 请严格输出一个标准的JSON数组格式，单占一行，必须使用双引号，格式如下：["标题1", "标题2", "标题3"]。
+        4. 绝对禁止在标题中包含任何具体人名或称谓（必须客观化表达）。
+        5. 请仔细对比【历史选题黑名单】，主动拉开差异。
+        6. 🌟为每个卡片标题生成一个简短的原因说明（主要解释为什么从临床决策角度提取这个标题）。
+        7. 请严格输出一个标准的JSON数组格式，单占一行，必须使用双引号，格式如下：["标题1", "标题2", "标题3"]。
         如果实在没有新角度，输出 []。
         """
 

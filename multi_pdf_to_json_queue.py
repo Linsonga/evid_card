@@ -46,15 +46,13 @@ import asyncio
 from filelock import FileLock
 import shutil
 from pathlib import Path
+from config import LAYOUT_PATH
 
 # LAYOUT_PATH = "/root/autodl-tmp/GLS/model/"
-LAYOUT_PATH = "/root/Data/rlj/ocrV5/model/"
-# LAYOUT_PATH = "/root/autodl-tmp/evidence_card_online/model/"
 SAVE_PATH = '/root/Data/GLS/evidence_card/'
 
 class PDFParsing():
     def __init__(self, layout_path, **kwargs):
-
 
         self.model_dir_path = layout_path
         self.layout_engine = YOLO(f'{self.model_dir_path}yolo12x_best.pt')

@@ -288,7 +288,7 @@ def check_dynamic_issue(title, core_conclusion, issue_name):
 
 def build_materials_and_references(materials_part_data):
     """
-    从 materials_part 数据中提取并格式化：
+    从 materials_part_data (即 pass_info) 中提取并格式化：
     1. 给大模型阅读的带编号正文材料 (formatted_materials)
     2. 放在文末的标准参考文献列表 (reference_list)
     """
@@ -296,67 +296,71 @@ def build_materials_and_references(materials_part_data):
     formatted_references = []
     ref_index = 1
 
-    # 遍历外部数组
-    for item in materials_part_data:
-        # 获取内嵌的 info JSON 字符串
-        info_str = item.get("info", "{}")
-
+    # === 1. 安全地将传入的数据解析为字典 ===
+    if isinstance(materials_part_data, str):
         try:
-            info_dict = json.loads(info_str)
-        except json.JSONDecodeError:
-            continue  # 如果解析 JSON 失败，跳过该条目
+            data_dict = json.loads(materials_part_data)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON 解析失败1: {e}")
+            return ""
+    elif isinstance(materials_part_data, dict):
+        data_dict = materials_part_data
+    else:
+        logger.error("传入的数据类型既不是字符串也不是字典")
+        return ""
 
-        # 提取 reference 列表（包含了论文、指南等）
-        references = info_dict.get("reference", [])
+    # === 2. 直接从最外层获取 reference 列表 ===
+    # 注意看你的打印数据，reference 是最外层的 key，不需要再找 "info" 了
+    references = data_dict.get("reference", [])
 
-        for ref in references:
-            # === 1. 提取作者/制定者 ===
-            author_list = ref.get("author", [])
-            if author_list:
-                author = ";".join(author_list)
-            else:
-                # 指南类文献通常没有 author 字段，而是有 zdz (制定者)
-                author = ref.get("zdz", "佚名")
+    if not references:
+        return ""
 
-            # === 2. 提取标题 ===
-            # 有的叫 title，有的叫 literatureTitle，这里做个兼容
-            title = ref.get("title") or ref.get("literatureTitle", "未知标题")
+    # === 3. 遍历真实的文献列表进行提取 (保留了你原本完美的提取逻辑) ===
+    for ref in references:
+        # === 1. 提取作者/制定者 ===
+        author_list = ref.get("author", [])
+        if author_list:
+            author = ";".join(author_list)
+        else:
+            # 指南类文献通常没有 author 字段，而是有 zdz (制定者)
+            author = ref.get("zdz", "佚名")
 
-            # === 3. 提取期刊出处 ===
-            journal = ref.get("journal", "")
-            if not journal:
-                # 指南类没有 journal，通常在 cc 字段，格式如 "中医杂志.2021..."
-                cc = ref.get("cc", "")
-                journal = cc.split(".")[0] if "." in cc else cc
-            if not journal:
-                journal = "未知出处"
+        # === 2. 提取标题 ===
+        title = ref.get("title") or ref.get("literatureTitle", "未知标题")
 
-            # === 4. 提取年份 ===
-            year = ref.get("year", "未知年份")
+        # === 3. 提取期刊出处 ===
+        journal = ref.get("journal", "")
+        if not journal:
+            cc = ref.get("cc", "")
+            journal = cc.split(".")[0] if "." in cc else cc
+        if not journal:
+            journal = "未知出处"
 
-            # === 5. 提取摘要/核心内容 ===
-            # 论文通常是 summary，指南通常是 nrjs (内容介绍)
-            summary = ref.get("summary", "")
-            if not summary:
-                summary = ref.get("nrjs", "缺少具体摘要内容，请结合标题及临床经验推断。")
+        # === 4. 提取年份 ===
+        year = ref.get("year", "未知年份")
 
-            # === 6. 组装：给大模型阅读的【资料 X】 ===
-            material_text = f"【资料 {ref_index}】\n文献标题：{title}\n文献出处：{journal} ({year})\n核心内容：{summary}\n"
-            formatted_materials.append(material_text)
+        # === 5. 提取摘要/核心内容 ===
+        summary = ref.get("summary", "")
+        if not summary:
+            summary = ref.get("nrjs", "缺少具体摘要内容，请结合标题及临床经验推断。")
 
-            # === 7. 组装：文末的 [X] 参考文献 ===
-            # 格式：[序号] 作者.标题[J]. 期刊,年份
-            ref_str = f"[{ref_index}] {author}.{title}[J]. {journal},{year}"
-            formatted_references.append(ref_str)
+        # # === 6. 组装：给大模型阅读的【资料 X】 ===
+        # material_text = f"【资料 {ref_index}】\n文献标题：{title}\n文献出处：{journal} ({year})\n核心内容：{summary}\n"
+        # formatted_materials.append(material_text)
 
-            # 递增序号
-            ref_index += 1
+        # === 7. 组装：文末的 [X] 参考文献 ===
+        ref_str = f"[{ref_index}] {author}.{title}[J]. {journal},{year}"
+        formatted_references.append(ref_str)
+
+        # 递增序号
+        ref_index += 1
 
     # 将数组拼接为带有换行符的字符串
-    materials_text = "\n".join(formatted_materials)
+    # materials_text = "\n".join(formatted_materials)
     references_text = "\n".join(formatted_references)
 
-    return materials_text, references_text
+    return references_text
 
 async def run_wechat_mcp_example(articles):
     """
@@ -779,8 +783,9 @@ class AgenticPipeline:
         local_rules = self.retrieve_local_memories(zone_name)
         pass_score_threshold = 70 if (not batch_id or batch_id == "GLOBAL_ALL") else 80
 
-        for item in data_list:
+        for index, item in enumerate(data_list):
             current_title = item["title"]
+            item_id = item.get("id", "未知ID")  # 如果数据库有ID的话
             retry_count = 0
             is_passed = False
 
@@ -789,7 +794,7 @@ class AgenticPipeline:
 
             # ======= 进入 反思抢救循环 =======
             while retry_count <= MAX_RETRIES:
-                print(f"\n[尝试 {retry_count + 1}/{MAX_RETRIES + 1}] 审核: {current_title}")
+                print(f"\n[第 {index + 1} 条数据 / ID: {item_id}] [尝试 {retry_count + 1}/{MAX_RETRIES + 1}] 审核: {current_title}")
                 feedback_reasons = []
                 has_fatal_issue = False
 
@@ -835,8 +840,7 @@ class AgenticPipeline:
                         print(">> 启动 Reflexion 反思引擎，大模型正在自我重写修复...")
                         feedback_str = "\n".join(feedback_reasons)
                         # 让大模型重写并覆盖 current_info 进入下一轮循环
-                        current_info = self.rewrite_info_with_feedback(current_title, current_info, feedback_str,
-                                                                       local_rules)
+                        current_info = self.rewrite_info_with_feedback(current_title, current_info, feedback_str,local_rules)
 
                     retry_count += 1
 
@@ -846,7 +850,6 @@ class AgenticPipeline:
             else:
                 item["score_reason"] = "经过多次重试依然不合格: " + " | ".join(feedback_reasons)
                 failed_data.append(item)
-
         # ================== 阶段：总结错题，进化记忆树 ==================
         if failed_data:
             print(">> 触发动态规则树进化...")
@@ -888,16 +891,31 @@ class AgenticPipeline:
                         cursor.close()
                         conn.close()
 
-                print(f">> 正在生成高分专区卡片: {pass_title}")
-                formatted_materials = f"{materials}\n" if materials else ""
-                reference_list = ""
+                print(f">> 正在生成高分专区卡片 (ID: {item.get('id', '未知ID')}): {pass_title}")
+                # 向量库中查询的数据
+                materials = f"\n{materials}" if materials else ""
+                # mysql查询的数据
+                references_text = build_materials_and_references(pass_info) if pass_info else ""
 
-                system_prompt = '你现在是“医学证据卡片选题总编 + 临床知识编辑”。'
+                # ================= 修复部分开始 =================
+                # 安全提取 pass_info 中的 reference，并转为纯文本以节省 Token
+                extracted_refs = ""
+                if pass_info:
+                    # 1. 如果是字符串，先解析为字典
+                    parsed_info = json.loads(pass_info) if isinstance(pass_info, str) else pass_info
+                    # 2. 提取 reference 数组
+                    refs_list = parsed_info.get("reference", [])
+                    # 3. 将数组转回 JSON 字符串，确保大模型能读懂且不乱码
+                    extracted_refs = json.dumps(refs_list, ensure_ascii=False)
+                # ================= 修复部分结束 =================
+
+                print(materials)
+                print()
+
+                system_prompt = '你现在是医学证据卡片选题总编和临床知识编辑'
                 user_prompt = f"""
                 你的任务不是写一篇普通医学科普，也不是机械整理资料，而是基于我提供的全部材料、选定的题目，为医生生产一张“可读、可用、可检索、可沉淀为个人知识资产”的单张证据卡片。
-
                 本次选定的卡片题目是：【 {pass_title} 】
-
                 你的最高目标有五个：
                 1. 本卡片必须服务于一个明确的临床决策，而不是泛泛介绍疾病。
                 2. 本卡片必须同时吸收：医生资料（若有）、思维导图/决策树（若有）、医案（若有）、书籍（若有）、指南、文献、联网搜索和学术搜索结果。
@@ -907,10 +925,10 @@ class AgenticPipeline:
 
                 一、必须使用的资料范围与使用原则
                 你必须优先并显式整合以下来源，但当上传材料与外部证据不一致时，必须明确区分“医生经验逻辑”“资料原文观点”“外部循证结论”，不能混写。不得只根据我上传的一份资料直接成文，必须交叉验证。
-                我已将资料资料筛选出精华片段，如下：
-                {materials_part}{pass_info}
+                我已将资料筛选出精华片段，如下：
+                {extracted_refs}
 
-                1. 决策树 / 思维导图：提取风险因素分层、症状识别路径、辅助检查路径、证候判定条件、治法选择逻辑、对症加减规则。这决定“临床推理顺序”，不是单纯摘抄内容。
+                1. 决策树/思维导图：提取风险因素分层、症状识别路径、辅助检查路径、证候判定条件、治法选择逻辑、对症加减规则。这决定“临床推理顺序”，不是单纯摘抄内容。
                 2. 医案与书籍：提取核心病机、主要/兼夹病机、理法方药对应、加减思路、剂量逻辑、动态调整、误治漏治转折点。这决定“为什么这样治”，不是只提方名药名。
                 3. 指南与文献：作为“校准器”和“证据增强器”。提取推荐意见、适应证/不适用人群、证据等级、结局指标、安全性信息。
 
@@ -948,13 +966,9 @@ class AgenticPipeline:
                    - 再写证据解释（指标改善意味着什么、是否改变长期风险、样本量偏倚等）
                 7. 随访与调护：哪些患者需密切复查、生活方式关键干预点、情志饮食作息对决策的影响、何种情况需重新辨证。
                 8. 证据边界与未解决问题：当前证据不足之处、经验与证据未完全对齐之处、哪些结论更适合“辅助决策”。
-                9. 正文文献角标（核心强制要求）：在正文（尤其是“核心结论”、“决策依据”和“详细数据支持”模块）中，每当你陈述了一个具体的指南推荐、文献数据或研究结论时，必须在句子末尾直接标出对应的参考文献角标（例如：[1]、[2]、[1][3]）。
-                10. 参考文献：必须在文章最末尾单独列出“参考文献”模块。严格按照标准格式输出所有引用的文献，编号必须与正文中的角标严格一一对应！
-                   格式示例：
-                   [1] 顾燕(综述);曾燕(审校).肝癌磁共振分子影像诊断的研究进展[J]. 重庆医学,2014
-                   [2] 袁惊雷;谢晓桐;张佩娜;马立恒.基于CT和MRI影像组学的机器学习模型预测肝癌早期复发的研究进展[J]. 磁共振成像,2022
-                   [3] 秦建民;顾新刚.超声造影成像技术在肝癌早期诊断与治疗中应用价值[J]. 肝胆外科杂志,2015(0)
-
+                9. 正文文献角标（核心强制要求）：在正文中每当你陈述了一个具体的指南推荐、文献数据或研究结论时，必须在句子末尾直接标出对应的参考文献角标（必须与上方提供的【资料 X】编号严格对应，例如：[1]、[2]、[1][3]）。
+                10. 参考文献：**必须在文章最末尾单独列出“参考文献”模块。请注意：你只能列出你在正文中实际打过角标的文献！**请从下方的【候选参考文献列表】中挑选你用到的文献原样输出；**如果某篇文献你在正文中没有引用，绝对不要把它放进最终的列表中！**
+                
                 五、输出前自检清单
                 在输出最终证据卡片前，你必须自检并确保：
                 1. 这张卡片是否真的只服务一个核心决策？
@@ -972,20 +986,23 @@ class AgenticPipeline:
                 - 机械模板化，用空话代替结论。
                 - 把医案直接改写成科普，把指南内容堆砌成综述。
 
-                【当前专区历史踩坑教训（绝对避免）】：
-                {dynamic_bans}
+                【候选参考文献列表】（仅供提取，请勿全量照抄）：
+                {references_text}
                 """
+
+                # 【当前专区历史踩坑教训（绝对避免）】：
+                # {dynamic_bans}
 
                 output_dir = os.path.join("card_md", f"evidence_cards_{pass_title}")
                 os.makedirs(output_dir, exist_ok=True)
 
                 messages = [{"role": "user", "content": user_prompt}]
-                card_res = requestQwenMultiTurn(system_prompt, messages)
-
+                card_res = requestQwenMultiTurn(system_prompt, messages, False, False)
+                print(card_res)
+                print()
                 safe_title = re.sub(r'[\\/:*?"<>|]', '_', pass_title)[:40]
                 with open(os.path.join(output_dir, f"_{safe_title}.md"), "w", encoding="utf-8") as f:
                     f.write(card_res)
-
 
         return True
 
