@@ -37,6 +37,43 @@ from utils import (get_distributed_filenames, record_distribution, requestQwenMu
 from config import WECHAT_APP_ID, WECHAT_APP_SECRET
 
 
+# 修改参考文献序号
+def normalize_references(md_text: str) -> str:
+    # 1. 拆分正文和参考文献
+    parts = re.split(r'(参考文献)', md_text, maxsplit=1)
+    if len(parts) < 3:
+        return md_text  # 没有参考文献
+
+    body, ref_title, refs = parts
+
+    # 2. 提取参考文献编号
+    ref_items = re.findall(r'\[(\d+)\]', refs)
+    unique_nums = []
+    for n in ref_items:
+        if n not in unique_nums:
+            unique_nums.append(n)
+
+    # 3. 构建映射 old -> new
+    mapping = {old: str(i+1) for i, old in enumerate(unique_nums)}
+
+    # 4. 删除正文中不存在的引用（如[1]）
+    def clean_invalid(match):
+        num = match.group(1)
+        return f"[{mapping[num]}]" if num in mapping else ""
+
+    body = re.sub(r'\[(\d+)\]', clean_invalid, body)
+
+    # 5. 替换参考文献编号
+    def replace_ref(match):
+        num = match.group(1)
+        return f"[{mapping[num]}]"
+
+    refs = re.sub(r'\[(\d+)\]', replace_ref, refs)
+
+    return body + ref_title + refs
+
+
+
 def get_seasonal_articles_realtime(candidate_files):
     """
     使用联网搜索获取实时热点并匹配文件
@@ -403,6 +440,49 @@ def process_list_block(block_lines):
     return result
 
 
+#
+# def format_wechat_references(md_text: str) -> str:
+#     if not md_text:
+#         return ""
+#
+#     # 1. 清理特殊空格
+#     md_text = md_text.replace('\xa0', ' ')
+#
+#     # 2. 去掉 --- 分隔符
+#     md_text = re.sub(
+#         r'[-—－]{2,}\s*(\*{0,2}参考文献\*{0,2})',
+#         r'\1',
+#         md_text
+#     )
+#
+#     # 3. 在“参考文献”后面强制加 <br>
+#     md_text = re.sub(
+#         r'(\*{0,2}参考文献\*{0,2})',
+#         r'\1<br>',
+#         md_text
+#     )
+#
+#     # 4. 拆分正文和参考文献部分
+#     parts = re.split(r'(\*{0,2}参考文献\*{0,2}<br>)', md_text)
+#
+#     if len(parts) >= 3:
+#         ref_body = parts[-1].strip()
+#
+#         # 5. 给每个 [n] 前加换行（除了第一个）
+#         formatted_ref_body = re.sub(
+#             r'(?<!^)\s*(\[|［|【)\s*(\d+)\s*(\]|］|】)',
+#             r'<br>[\2] ',
+#             ref_body
+#         )
+#
+#         # 6. 清理开头可能多余的 <br>
+#         formatted_ref_body = re.sub(r'^<br>', '', formatted_ref_body)
+#
+#         parts[-1] = formatted_ref_body
+#         md_text = "".join(parts)
+#
+#     return md_text
+# import re
 
 def format_wechat_references(md_text: str) -> str:
     if not md_text:
@@ -411,24 +491,38 @@ def format_wechat_references(md_text: str) -> str:
     # 1. 清理特殊空格
     md_text = md_text.replace('\xa0', ' ')
 
-    # 2. 去掉 --- 分隔符
+    # 2. 去掉 --- 分隔符（整行）
+    md_text = re.sub(r'^\s*[-—－]{2,}\s*$', '', md_text, flags=re.MULTILINE)
+
+    # 3. 统一参考文献标题（支持 ### / ** / 普通）
+    # 1处理 ### 参考文献
     md_text = re.sub(
-        r'[-—－]{2,}\s*(\*{0,2}参考文献\*{0,2})',
-        r'\1',
-        md_text
+        r'^\s*#{1,6}\s*参考文献\s*$',
+        '<br><br>参考文献<br>',
+        md_text,
+        flags=re.MULTILINE
     )
 
-    # 3. 在“参考文献”后面强制加 <br>
+    # 2 处理 **参考文献**
     md_text = re.sub(
-        r'(\*{0,2}参考文献\*{0,2})',
-        r'\1<br>',
-        md_text
+        r'^\s*\*\*参考文献\*\*\s*$',
+        '<br><br>参考文献<br>',
+        md_text,
+        flags=re.MULTILINE
     )
 
-    # 4. 拆分正文和参考文献部分
-    parts = re.split(r'(\*{0,2}参考文献\*{0,2}<br>)', md_text)
+    # 3 兜底（普通“参考文献”）
+    md_text = re.sub(
+        r'^\s*参考文献\s*$',
+        '<br>参考文献<br>',
+        md_text,
+        flags=re.MULTILINE
+    )
 
-    if len(parts) >= 3:
+    # 4. 拆分正文和参考文献
+    parts = md_text.split('<br>参考文献<br>')
+
+    if len(parts) >= 2:
         ref_body = parts[-1].strip()
 
         # 5. 给每个 [n] 前加换行（除了第一个）
@@ -438,14 +532,13 @@ def format_wechat_references(md_text: str) -> str:
             ref_body
         )
 
-        # 6. 清理开头可能多余的 <br>
+        # 6. 清理开头多余 <br>
         formatted_ref_body = re.sub(r'^<br>', '', formatted_ref_body)
 
         parts[-1] = formatted_ref_body
-        md_text = "".join(parts)
+        md_text = '<br>参考文献<br>'.join(parts)
 
     return md_text
-
 
 def remove_fragments(text: str) -> str:
     """
@@ -457,10 +550,10 @@ def remove_fragments(text: str) -> str:
 
 def main():
     # --- 配置项 ---
-    md_dir = "card_md"
+    md_dir = "/root/autodl-tmp/evidence_card_online/card_md"
     test_mode = True  # 设置为 True 则只选取较少数量测试
-    batch_size = 1
-    draft_mode = True  # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
+    batch_size = 5
+    draft_mode = False # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
     # --------------
 
     if not os.path.exists(md_dir):
@@ -490,17 +583,17 @@ def main():
     print(f"共发现 {len(all_md_files)} 个文件，待发布 {len(unpublished_files)} 个。")
 
     # 3. 联网搜索实时热点并筛选
-    # seasonal_files = get_seasonal_articles_realtime(unpublished_files)
-    #
-    # if not seasonal_files:
-    #     print("未匹配到实时热点文章。")
-    #     if test_mode:
-    #         print("测试模式：强制选取第一个待发布文件进行测试。")
-    #         seasonal_files = unpublished_files[:batch_size]
-    #     else:
-    #         return
+    seasonal_files = get_seasonal_articles_realtime(unpublished_files)
 
-    seasonal_files = unpublished_files[:batch_size]
+    if not seasonal_files:
+        print("未匹配到实时热点文章。")
+        if test_mode:
+            print("测试模式：强制选取第一个待发布文件进行测试。")
+            seasonal_files = unpublished_files[:batch_size]
+        else:
+            return
+
+    # seasonal_files = unpublished_files[:batch_size]
     # 4. 构建待发布的 articles 列表数据
     articles_to_publish = []
 
@@ -534,6 +627,9 @@ def main():
             content = format_wechat_nested_list(content)
 
             content = re.sub(r'^#\s+.*(?:\r?\n|$)', '', content, count=1).strip()
+
+            # 修改参考文献序号
+            content = normalize_references(content)
 
             print(f"正在为生成 AI 封面...")
             cover_abs_path = generate_ai_cover_dashscope_api(title=title)

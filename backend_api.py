@@ -868,7 +868,7 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
                     similarities = cosine_similarity(topic_vec, history_mat)[0]
                     max_sim = np.max(similarities)
 
-                    if max_sim > 0.82:
+                    if max_sim > 0.95:
                         print(f"⚠️ 触发防重叠机制: [{title}] 与历史相似度最高达 {max_sim:.2f}，标记为重复(1)。")
                         name_repeat = 1
 
@@ -1250,63 +1250,63 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             os.remove(file_path)
 
 
-
-def mock_db_execute_update(files: List[FileCallbackItem]):
-    """使用 PyMySQL 执行实际的数据库写入和更新操作"""
-    if not files:
-        return
-
-    insert_card_data   = []
-    update_status_data = []
-
-    for file in files:
-        file_id = int(file.id)
-        user_id = int(file.user_id)
-
-        card_name = "安神抗癫方联合西药治疗癫痫中血清 SOD 水平回升幅度作为氧自由基清除达标及减药"
-        name_repeat = 0
-        status = 1
-        name_info = "描述xxxxxx"
-        status_time = 1776594104631
-        insert_card_data.append((file_id, card_name, user_id, name_repeat, status, name_info, status_time))
-        update_status_data.append((file_id,))
-
-    conn   = None
-    cursor = None
-
-    try:
-        conn   = pymysql.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-
-        insert_sql = """
-            INSERT INTO evidence_file_card_name (file_id, card_name, user_id, name_repeat, status, name_info, status_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """
-        cursor.executemany(insert_sql, insert_card_data)
-        print(f"[DB LOG] 成功插入 {cursor.rowcount} 条记录到 evidence_file_card_name")
-
-        # # 批量更新 evidence_file_info 表的状态
-        # update_sql = """
-        #     UPDATE evidence_file_info
-        #     SET file_status = 1
-        #     WHERE id = %s
-        # """
-        # cursor.executemany(update_sql, update_status_data)
-        # print(f"[DB LOG] 成功更新 {cursor.rowcount} 条记录的 file_status")
-
-        conn.commit()
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"[DB ERROR] 数据库操作失败，已回滚: {e}")
-        raise e
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+#
+# def mock_db_execute_update(files: List[FileCallbackItem]):
+#     """使用 PyMySQL 执行实际的数据库写入和更新操作"""
+#     if not files:
+#         return
+#
+#     insert_card_data   = []
+#     update_status_data = []
+#
+#     for file in files:
+#         file_id = int(file.id)
+#         user_id = int(file.user_id)
+#
+#         card_name = "安神抗癫方联合西药治疗癫痫中血清 SOD 水平回升幅度作为氧自由基清除达标及减药"
+#         name_repeat = 0
+#         status = 1
+#         name_info = "描述xxxxxx"
+#         status_time = 1776594104631
+#         insert_card_data.append((file_id, card_name, user_id, name_repeat, status, name_info, status_time))
+#         update_status_data.append((file_id,))
+#
+#     conn   = None
+#     cursor = None
+#
+#     try:
+#         conn   = pymysql.connect(**DB_CONFIG)
+#         cursor = conn.cursor()
+#
+#         insert_sql = """
+#             INSERT INTO evidence_file_card_name (file_id, card_name, user_id, name_repeat, status, name_info, status_time)
+#             VALUES (%s, %s, %s, %s, %s, %s, %s)
+#         """
+#         cursor.executemany(insert_sql, insert_card_data)
+#         print(f"[DB LOG] 成功插入 {cursor.rowcount} 条记录到 evidence_file_card_name")
+#
+#         # # 批量更新 evidence_file_info 表的状态
+#         # update_sql = """
+#         #     UPDATE evidence_file_info
+#         #     SET file_status = 1
+#         #     WHERE id = %s
+#         # """
+#         # cursor.executemany(update_sql, update_status_data)
+#         # print(f"[DB LOG] 成功更新 {cursor.rowcount} 条记录的 file_status")
+#
+#         conn.commit()
+#
+#     except Exception as e:
+#         if conn:
+#             conn.rollback()
+#         print(f"[DB ERROR] 数据库操作失败，已回滚: {e}")
+#         raise e
+#
+#     finally:
+#         if cursor:
+#             cursor.close()
+#         if conn:
+#             conn.close()
 
 
 # ================= 🌟 新增：手动触发生成卡片的请求模型 =================
@@ -1375,7 +1375,7 @@ async def download_convert_and_process(file_url: str, download_path: str, ext: s
     try:
         # ── 1. 在后台执行下载 ──
         def download_file_sync(url, path):
-            response = requests.get(url, timeout=600)
+            response = requests.get(url, timeout=(10, 800))
             response.raise_for_status()
             with open(path, 'wb') as f:
                 f.write(response.content)
