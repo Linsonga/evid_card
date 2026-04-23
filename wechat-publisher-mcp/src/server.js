@@ -111,66 +111,95 @@ server.registerTool(
 server.registerTool(
   "wechat_mass_send",
   {
-    description: "群发图文消息给微信公众号所有关注者或指定标签用户（主动推送到粉丝消息列表）",
+    description: "群发图文消息给微信公众号所有关注者或指定标签用户（主动推送到粉丝消息列表，支持多图文）",
     inputSchema: {
-      title: z.string().describe("文章标题"),
-      content: z.string().describe("Markdown格式的文章内容"),
-      author: z.string().describe("作者名称"),
+      articles: z.array(z.object({
+        title: z.string().describe("文章标题"),
+        content: z.string().describe("Markdown格式的文章内容"),
+        author: z.string().optional().describe("作者名称"),
+        coverImagePath: z.string().optional().describe("封面图片本地路径"),
+        coverImageUrl: z.string().optional().describe("封面图片URL")
+      })).describe("文章列表（支持多图文，最多8篇）"),
       appId: z.string().describe("微信公众号AppID"),
       appSecret: z.string().describe("微信公众号AppSecret"),
-      coverImagePath: z.string().optional().describe("封面图片路径"),
+      coverImagePath: z.string().optional().describe("全局封面图片路径（兼容单图文）"),
+      coverImageUrl: z.string().optional().describe("全局封面图片URL（兼容单图文）"),
       isToAll: z.boolean().default(true).describe("是否群发给所有粉丝，false时需提供tagId"),
       tagId: z.number().optional().describe("标签ID，isToAll=false时必须提供"),
       sendIgnoreReprint: z.number().default(0).describe("0:允许被转载 1:不允许转载")
     }
   },
   async (params) => {
-    const { title, content, author, appId, appSecret, coverImagePath, isToAll, tagId, sendIgnoreReprint } = params;
-    logger.info(`Mass sending article: ${title}`);
+    const { articles, appId, appSecret, coverImagePath, coverImageUrl, isToAll, tagId, sendIgnoreReprint } = params;
+    logger.info(`Mass sending ${articles?.length || 0} article(s)`);
 
     try {
       const wechatAPI = new WeChatAPI(appId, appSecret);
-      const htmlContent = MarkdownConverter.convertToWeChatHTML(content);
+      const processedArticles = [];
 
-      // 处理封面图：没有提供时自动生成（uploadnews 接口要求必须有 thumb_media_id）
-      let thumbMediaId = null;
-      let coverPath = coverImagePath;
+      // 遍历处理每一篇文章（Markdown转HTML + 封面图处理）
+      for (let i = 0; i < articles.length; i++) {
+        const art = articles[i];
+        const htmlContent = MarkdownConverter.convertToWeChatHTML(art.content);
+        let thumbMediaId = null;
 
-      if (!coverPath) {
-        logger.info('未提供封面图，自动生成...');
-        coverPath = await WeChatPublisher.generateCoverImage(title, content);
-      }
+        // 获取封面图（优先使用单篇配置，第1篇兼容全局配置）
+        let coverPath = art.coverImagePath || (i === 0 ? coverImagePath : null);
+        let coverUrl = art.coverImageUrl || (i === 0 ? coverImageUrl : null);
 
-      if (coverPath) {
-        try {
-          thumbMediaId = await wechatAPI.uploadCoverImage(coverPath);
-          logger.info('封面图上传成功', { mediaId: thumbMediaId });
-
-          // 清理自动生成的临时文件
-          if (!coverImagePath) {
-            const fs = await import('fs/promises');
-            await fs.default.unlink(coverPath).catch(() => {});
-          }
-        } catch (e) {
-          logger.error(`封面图上传失败: ${e.message}`);
-          throw new Error(`群发需要封面图，但上传失败: ${e.message}`);
+        // 如果没有本地路径但有URL，尝试下载
+        if (!coverPath && coverUrl) {
+          logger.info(`第 ${i + 1} 篇：检测到封面图URL，开始下载...`);
+          coverPath = await WeChatPublisher.downloadImage(coverUrl);
         }
+
+        // 仍然没有封面图则自动生成（微信接口要求每篇必须有 thumb_media_id）
+        if (!coverPath) {
+          logger.info(`第 ${i + 1} 篇：未提供封面图，自动生成...`);
+          coverPath = await WeChatPublisher.generateCoverImage(art.title, art.content);
+        }
+
+        if (coverPath) {
+          try {
+            thumbMediaId = await wechatAPI.uploadCoverImage(coverPath);
+            logger.info(`第 ${i + 1} 篇：封面图上传成功`, { mediaId: thumbMediaId });
+
+            // 清理自动生成的或下载的临时文件
+            const isAutoGenOrUrl = !art.coverImagePath && !(i === 0 && coverImagePath);
+            if (isAutoGenOrUrl) {
+              const fs = await import('fs/promises');
+              await fs.default.unlink(coverPath).catch(() => {});
+            }
+          } catch (e) {
+            logger.error(`第 ${i + 1} 篇封面图上传失败: ${e.message}`);
+            throw new Error(`第 ${i + 1} 篇群发需要封面图，但上传失败: ${e.message}`);
+          }
+        } else {
+          throw new Error(`第 ${i + 1} 篇文章缺少封面图`);
+        }
+
+        processedArticles.push({
+          title: art.title,
+          content: htmlContent,
+          author: art.author || '',
+          thumbMediaId
+        });
       }
 
+      // 调用底层的发送接口
       const result = await wechatAPI.sendAllMessage({
-        title,
-        content: htmlContent,
-        author,
-        thumbMediaId,
+        articles: processedArticles,
         isToAll: isToAll !== false,
         tagId,
         sendIgnoreReprint: sendIgnoreReprint || 0
       });
 
-      let text = `✅ 群发成功！\n\n`;
-      text += `📱 标题: ${title}\n`;
-      text += `👤 作者: ${author}\n`;
-      text += `📨 消息ID: ${result.msgId}\n`;
+      // 拼接成功响应文案
+      let text = `✅ 群发成功！共包含 ${articles.length} 篇文章\n\n`;
+      articles.forEach((art, idx) => {
+        text += `📝 图文 ${idx + 1}: ${art.title}\n`;
+      });
+      text += `\n📨 消息ID: ${result.msgId}\n`;
       text += `📊 消息数据ID: ${result.msgDataId}\n`;
       text += `🎯 群发范围: ${isToAll !== false ? '所有粉丝' : `标签ID ${tagId} 的粉丝`}\n`;
       text += `\n🎉 文章已推送到粉丝消息列表，粉丝将收到消息通知。`;
@@ -185,6 +214,84 @@ server.registerTool(
     }
   }
 );
+//// 注册群发工具
+//server.registerTool(
+//  "wechat_mass_send",
+//  {
+//    description: "群发图文消息给微信公众号所有关注者或指定标签用户（主动推送到粉丝消息列表）",
+//    inputSchema: {
+//      title: z.string().describe("文章标题"),
+//      content: z.string().describe("Markdown格式的文章内容"),
+//      author: z.string().describe("作者名称"),
+//      appId: z.string().describe("微信公众号AppID"),
+//      appSecret: z.string().describe("微信公众号AppSecret"),
+//      coverImagePath: z.string().optional().describe("封面图片路径"),
+//      isToAll: z.boolean().default(true).describe("是否群发给所有粉丝，false时需提供tagId"),
+//      tagId: z.number().optional().describe("标签ID，isToAll=false时必须提供"),
+//      sendIgnoreReprint: z.number().default(0).describe("0:允许被转载 1:不允许转载")
+//    }
+//  },
+//  async (params) => {
+//    const { title, content, author, appId, appSecret, coverImagePath, isToAll, tagId, sendIgnoreReprint } = params;
+//    logger.info(`Mass sending article: ${title}`);
+//
+//    try {
+//      const wechatAPI = new WeChatAPI(appId, appSecret);
+//      const htmlContent = MarkdownConverter.convertToWeChatHTML(content);
+//
+//      // 处理封面图：没有提供时自动生成（uploadnews 接口要求必须有 thumb_media_id）
+//      let thumbMediaId = null;
+//      let coverPath = coverImagePath;
+//
+//      if (!coverPath) {
+//        logger.info('未提供封面图，自动生成...');
+//        coverPath = await WeChatPublisher.generateCoverImage(title, content);
+//      }
+//
+//      if (coverPath) {
+//        try {
+//          thumbMediaId = await wechatAPI.uploadCoverImage(coverPath);
+//          logger.info('封面图上传成功', { mediaId: thumbMediaId });
+//
+//          // 清理自动生成的临时文件
+//          if (!coverImagePath) {
+//            const fs = await import('fs/promises');
+//            await fs.default.unlink(coverPath).catch(() => {});
+//          }
+//        } catch (e) {
+//          logger.error(`封面图上传失败: ${e.message}`);
+//          throw new Error(`群发需要封面图，但上传失败: ${e.message}`);
+//        }
+//      }
+//
+//      const result = await wechatAPI.sendAllMessage({
+//        title,
+//        content: htmlContent,
+//        author,
+//        thumbMediaId,
+//        isToAll: isToAll !== false,
+//        tagId,
+//        sendIgnoreReprint: sendIgnoreReprint || 0
+//      });
+//
+//      let text = `✅ 群发成功！\n\n`;
+//      text += `📱 标题: ${title}\n`;
+//      text += `👤 作者: ${author}\n`;
+//      text += `📨 消息ID: ${result.msgId}\n`;
+//      text += `📊 消息数据ID: ${result.msgDataId}\n`;
+//      text += `🎯 群发范围: ${isToAll !== false ? '所有粉丝' : `标签ID ${tagId} 的粉丝`}\n`;
+//      text += `\n🎉 文章已推送到粉丝消息列表，粉丝将收到消息通知。`;
+//
+//      return { content: [{ type: "text", text }] };
+//    } catch (error) {
+//      logger.error(`群发失败: ${error.message}`);
+//      return {
+//        content: [{ type: "text", text: `❌ 群发失败: ${error.message}` }],
+//        isError: true
+//      };
+//    }
+//  }
+//);
 
 // 注册状态查询工具
 server.registerTool(

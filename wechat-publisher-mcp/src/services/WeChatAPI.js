@@ -573,20 +573,16 @@ class WeChatAPI {
   }
 
   /**
-   * 群发图文消息给所有关注者或指定标签用户
+   * 群发图文消息给所有关注者或指定标签用户（支持多图文）
    * 流程：draft/add 创建草稿，再调用 message/mass/sendall 群发
-   * （与 publishArticle 共用相同草稿创建逻辑，避免 uploadnews 的 media_id 兼容性问题）
    * @param {Object} options 群发选项
-   * @param {string} options.title 文章标题
-   * @param {string} options.content 文章HTML内容
-   * @param {string} [options.author] 作者
-   * @param {string} [options.thumbMediaId] 封面图媒体ID
+   * @param {Array} options.articles 处理后的文章数组
    * @param {boolean} [options.isToAll=true] 是否群发给所有粉丝
    * @param {number} [options.tagId] 标签ID，isToAll=false时必须提供
    * @param {number} [options.sendIgnoreReprint=0] 0:可转载 1:不可转载
-   * @returns {Promise<Object>} 群发结果，包含 msgId 和 msgDataId
+   * @returns {Promise<Object>} 群发结果
    */
-  async sendAllMessage({ title, content, author, thumbMediaId, isToAll = true, tagId, sendIgnoreReprint = 0 }) {
+  async sendAllMessage({ articles, isToAll = true, tagId, sendIgnoreReprint = 0 }) {
     if (this.appId.startsWith('test_')) {
       logger.info('测试模式：模拟群发成功');
       return {
@@ -597,27 +593,31 @@ class WeChatAPI {
       };
     }
 
-    logger.info('开始群发文章', { title, isToAll, tagId });
+    logger.info('开始群发文章', { articleCount: articles.length, isToAll, tagId });
     const accessToken = await this.getAccessToken();
 
-    // 1. 使用与 publishArticle 相同的 draft/add 创建草稿
-    const articleData = {
-      title,
-      author: author || '',
-      digest: this.extractDigest(content),
-      content,
-      content_source_url: '',
-      need_open_comment: 0,
-      only_fans_can_comment: 0
-    };
-    if (thumbMediaId) {
-      articleData.thumb_media_id = thumbMediaId;
-    }
+    // 1. 将传入的多篇文章组装为草稿对象
+    const draftArticles = articles.map(art => {
+      const articleData = {
+        title: art.title,
+        author: art.author || '',
+        digest: this.extractDigest(art.content),
+        content: art.content,
+        content_source_url: '',
+        need_open_comment: 0,
+        only_fans_can_comment: 0
+      };
+      if (art.thumbMediaId) {
+        articleData.thumb_media_id = art.thumbMediaId;
+      }
+      return articleData;
+    });
 
     try {
+      // 创建草稿（支持数组，自动组装为多图文）
       const draftResponse = await axios.post(
         `https://api.weixin.qq.com/cgi-bin/draft/add?access_token=${accessToken}`,
-        { articles: [articleData] },
+        { articles: draftArticles },
         { timeout: 30000 }
       );
 
@@ -626,9 +626,9 @@ class WeChatAPI {
       }
 
       const mediaId = draftResponse.data.media_id;
-      logger.info('草稿创建成功', { mediaId });
+      logger.info('群发草稿创建成功', { mediaId });
 
-      // 2. 群发草稿
+      // 2. 群发该草稿
       const filter = isToAll
         ? { is_to_all: true }
         : { is_to_all: false, tag_id: tagId };

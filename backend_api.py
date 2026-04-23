@@ -155,20 +155,24 @@ def get_user_history_titles(user_id: int) -> list:
             conn.close()
 
 # ================= 修改mysql状态 =================
-def update_file_parse_status(file_id: int, status: int):
+def update_file_parse_status(file_id: int, status: int, fail_reason: str = None):
     """
-    更新 evidence_file_info 表的解析状态
+    更新 evidence_file_info 表的解析状态及失败原因
     status: 1-解析完成；2-解析失败
     """
+    if fail_reason:
+        fail_reason = fail_reason[:250]  # 兜底防溢出
+
     conn = None
     cursor = None
     try:
         conn = pymysql.connect(**DB_CONFIG)
         cursor = conn.cursor()
-        sql = "UPDATE evidence_file_info SET file_status = %s WHERE id = %s"
-        cursor.execute(sql, (status, file_id))
+        # 🌟 修改点：SQL 语句增加 fail_reason 的更新
+        sql = "UPDATE evidence_file_info SET file_status = %s, fail_reason = %s WHERE id = %s"
+        cursor.execute(sql, (status, fail_reason, file_id))
         conn.commit()
-        print(f"[DB LOG] 文件ID {file_id} 状态更新为 {status}")
+        print(f"[DB LOG] 文件ID {file_id} 状态更新为 {status}, 失败原因: {fail_reason}")
     except Exception as e:
         if conn:
             conn.rollback()
@@ -593,7 +597,7 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
     for index, item in enumerate(chunked_data):
         text = item.get("text", "").strip()
         if not text:
-            return {"status": "error", "msg": f"解析失败：分块 {index} 文本为空"}
+            return {"status": "error", "msg": f"文本内容解析为空，请重新上传"}
         if type == 'pdf' and len(text) > 600:
             continue
         if is_garbage_text(text):
@@ -608,7 +612,7 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
         })
 
     if not valid_tasks:
-        return {"status": "error", "msg": "解析失败：文本内容过短(小于50字)或全为无效乱码，无有效数据入库"}
+        return {"status": "error", "msg": "文本内容过短，请重新上传"}
 
     # ================= 2. 并发获取向量 (解决速度极慢的问题) =================
     to_insert_batch = []
@@ -637,7 +641,7 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
             # 如果有任何一个块获取向量失败，触发“严控条件”，直接判定失败并返回
             err_msg = res.get("error", "未知错误")
             idx = res["task"]["index"]
-            return {"status": "error", "msg": f"解析失败：分块 {idx} 获取向量报错: {err_msg}"}
+            return {"status": "error", "msg": f"解析失败，请重试或重新上传"}
 
         task = res["task"]
         vec = res["vector"]
@@ -803,13 +807,13 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
 
         【标题字数与精炼红线】（最高优先级）：
         医生在手机上浏览专区时，标题必须极度精简、一目了然。
-        1. 每个卡片标题的字数必须严格控制在 10 到 15 个字之间！
+        1. 每个卡片标题的字数必须严格控制在 15 到 20 个字之间！
         2. 剔除所有不必要的连接词、助词和冗长的状语，提炼核心医学实体。
         3. 严禁使用提问式的长复句。
         【错误示范（35字）】：肝硬化腹水患者体位变化对心输出量和血管阻力的影响是否影响利尿剂使用时机
-        【正确示范（13字）】：肝硬化腹水体位与利尿剂时机
-        【错误示范（22字）】：幽门螺杆菌根除后针对不同病理类型的随访策略
-        【正确示范（14字）】：Hp根除后不同病理随访策略
+        【正确示范（18字）】：肝硬化腹水体位变化对利尿剂时机的影响
+        【错误示范（29字）】：关于幽门螺杆菌完全根除之后针对不同胃黏膜病理类型的随访策略
+        【正确示范（19字）】：幽门螺杆菌根除后不同病理类型的随访策略
         
         五、最终输出要求（仅输出选题清单）
         每次先给出一组候选题目（建议5-8个）。
@@ -817,9 +821,9 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
         【本轮任务】
         1. 输出 10 个证据卡片候选选题。
         2. 绝对禁止出现任何中文或英文标点符号。
-        3. 严格遵守 10-15 字的字数限制。
+        3. 严格遵守 15-20 字的字数限制。
         4. 请仔细对比【历史选题黑名单】，主动拉开差异。
-        5. 🌟 为每个卡片标题生成一个简短的原因说明（主要解释为什么从临床决策角度提取这个标题）。
+        5. 为每个卡片标题生成一个简短的原因说明（主要解释为什么从临床决策角度提取这个标题）。
         6. 请严格输出一个标准的JSON数组格式，单占一行，必须使用双引号。
         🌟 格式必须严格如下：
         [{{"title": "标题1", "reason": "提取原因说明1"}},{{"title": "标题2", "reason": "提取原因说明2"}}]
@@ -1069,6 +1073,13 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
         # 🌟 ===== 分支二：图片文件 (新增) =====
         elif ext in ['.png', '.jpg', '.jpeg']:
             print(f"[批次 {batch_id}] 任务 {task_id} 检测到图片类型，开始 OCR 识别...")
+            # 🌟 新增排查逻辑：检查文件是否为空
+            file_size = os.path.getsize(file_path)
+            if file_size < 100:  # 正常图片不可能小于 100 字节，很可能是下载到了 XML 报错文本
+                with open(file_path, 'r', errors='ignore') as f:
+                    content = f.read(200)
+                raise Exception(f"图片下载异常或损坏，文件过小。可能的内容片段: {content}")
+
             text_content = await extract_text_from_image(file_path)
 
             if not text_content or not text_content.strip():
@@ -1088,7 +1099,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 user_id=user_id, file_id=file_id
             )
         # ===== 分支二：PDF / xmind(PDF导出) 文件 =====
-        else:
+        elif ext in ['.xmind']:
             pdf_type = detect_pdf_type(file_path)
             print(f"[批次 {batch_id}] 任务 {task_id} 检测到文档类型: {pdf_type}")
 
@@ -1166,33 +1177,33 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                     user_id=user_id, file_id=file_id
                 )
 
-            else:
-                # 1. GPU 解析
-                async with gpu_lock:
-                    print(f"[批次 {batch_id}] 任务 {task_id} 开始 GPU 解析...")
-                    loop = asyncio.get_running_loop()
-                    data_lis, detected_lang = await loop.run_in_executor(
-                        None,
-                        pdf_parser_engine.pdf_parsing,
-                        file_path,
-                        None,
-                        False
-                    )
+        else:
+            # 1. GPU 解析
+            async with gpu_lock:
+                print(f"[批次 {batch_id}] 任务 {task_id} 开始 GPU 解析...")
+                loop = asyncio.get_running_loop()
+                data_lis, detected_lang = await loop.run_in_executor(
+                    None,
+                    pdf_parser_engine.pdf_parsing,
+                    file_path,
+                    None,
+                    False
+                )
 
-                # 2. 分块
-                chunked_data = chunk_text_data(data_lis, split_to_length=200)
-                print()
-                print("分块内容 ：")
-                print(chunked_data)
-                print()
-                # 3. 向量化并入库（共用 batch_id）
-                print(f"[批次 {batch_id}] 任务 {task_id} 开始入库...")
-                db_result = await async_process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_id=file_id)
+            # 2. 分块
+            chunked_data = chunk_text_data(data_lis, split_to_length=200)
+            print()
+            print("分块内容 ：")
+            print(chunked_data)
+            print()
+            # 3. 向量化并入库（共用 batch_id）
+            print(f"[批次 {batch_id}] 任务 {task_id} 开始入库...")
+            db_result = await async_process_and_insert_to_milvus(task_id, chunked_data, batch_id=batch_id, type='pdf', user_id=user_id, file_id=file_id)
 
         # --- 判定 Milvus 入库结果 ---
         if isinstance(db_result, dict) and db_result.get("status") == "success":
             # 🌟 全部流程成功：更新数据库状态为 1
-            update_file_parse_status(file_id, 1)
+            update_file_parse_status(file_id, 1, None)
 
             # 🌟 新增：触发卡片标题提炼
             embeddings = db_result.get("embeddings", [])
@@ -1207,7 +1218,8 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 print(f"[批次 {batch_id}] 任务 {task_id} 卡片标题提炼全部完成！")
         else:
             # 入库环节显式返回失败：更新状态为 2
-            update_file_parse_status(file_id, 2)
+            fail_msg = db_result.get("msg", "解析或入库失败") if isinstance(db_result, dict) else "未知错误"
+            update_file_parse_status(file_id, 2, fail_msg)
 
 
         # 保存任务完成状态
@@ -1226,14 +1238,15 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
     except Exception as e:
         print(f"[批次 {batch_id}] 任务 {task_id} 失败: {str(e)}")
         error_str = str(e)
-        # 🌟 新增：拦截 PDF 加密异常，替换为友好的用户提示
+        # 新增：拦截 PDF 加密异常，替换为友好的用户提示
         if "encrypted" in error_str.lower() or "password" in error_str.lower():
             friendly_error_msg = "文档加密，请解密后重新上传"
         else:
-            friendly_error_msg = type(e).__name__ + ": " + error_str
+            # friendly_error_msg = type(e).__name__ + ": " + error_str
+            friendly_error_msg = "文件解析失败"
 
-        # 🌟 捕获任何阶段的异常（下载后解析失败、分块失败等）：更新状态为 2
-        update_file_parse_status(file_id, 2)
+        # 捕获任何阶段的异常（下载后解析失败、分块失败等）：更新状态为 2
+        update_file_parse_status(file_id, 2, friendly_error_msg)
 
         error_data = {
             "task_id":   task_id,
@@ -1395,7 +1408,7 @@ async def download_convert_and_process(file_url: str, download_path: str, ext: s
     except Exception as e:
         print(f"❌ [任务 {task_id}] 下载或转换失败: {e}")
         # 失败时更新 MySQL 状态为 2
-        update_file_parse_status(file_id, 2)
+        update_file_parse_status(file_id, 2, f"文件下载异常")  # 截取前200字符防超长
 
         # 记录失败状态到文件
         error_data = {

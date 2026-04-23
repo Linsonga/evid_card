@@ -42,19 +42,30 @@ def normalize_references(md_text: str) -> str:
     # 1. 拆分正文和参考文献
     parts = re.split(r'(参考文献)', md_text, maxsplit=1)
     if len(parts) < 3:
-        return md_text  # 没有参考文献
+        return md_text  # 没有参考文献标题，直接返回
 
     body, ref_title, refs = parts
 
     # 2. 提取参考文献编号
     ref_items = re.findall(r'\[(\d+)\]', refs)
+
+    # ==========================================
+    # ✅ 新增逻辑：如果文献被删空了，连标题一起隐藏
+    # ==========================================
+    if not ref_items:
+        # 此时说明 refs 里没有任何 [1], [2] 等文献条目
+        # 我们不仅不返回 ref_title 和 refs，还要把 body 末尾的残留符号清理干净
+        # 清理可能前置的 <br>、#、*、横线或多余的换行和空格
+        clean_body = re.sub(r'(?:<br>|#|\*|\s|-|—|－)+$', '', body)
+        return clean_body
+
+    # 3. 构建映射 old -> new
     unique_nums = []
     for n in ref_items:
         if n not in unique_nums:
             unique_nums.append(n)
 
-    # 3. 构建映射 old -> new
-    mapping = {old: str(i+1) for i, old in enumerate(unique_nums)}
+    mapping = {old: str(i + 1) for i, old in enumerate(unique_nums)}
 
     # 4. 删除正文中不存在的引用（如[1]）
     def clean_invalid(match):
@@ -71,7 +82,6 @@ def normalize_references(md_text: str) -> str:
     refs = re.sub(r'\[(\d+)\]', replace_ref, refs)
 
     return body + ref_title + refs
-
 
 
 def get_seasonal_articles_realtime(candidate_files):
@@ -265,14 +275,14 @@ async def run_wechat_mcp_example(articles):
                 "articles": mcp_articles,  # 将多篇文章作为一个数组传给服务端
                 "appId": WECHAT_APP_ID,
                 "appSecret": WECHAT_APP_SECRET,
-                "previewMode": False,
             }
 
             # 4. 调用发布文章工具 (只调用一次！)
-            print(f"\n正在尝试调用 'wechat_publish_article' 打包发布 {len(mcp_articles)} 篇文章...")
+            print(f"\n正在尝试调用 'wechat_mass_send' 打包发布 {len(mcp_articles)} 篇文章...")
             try:
                 result = await session.call_tool(
-                    "wechat_publish_article",
+                    # "wechat_publish_article",
+                    "wechat_mass_send",
                     arguments=arguments
                 )
 
@@ -540,6 +550,14 @@ def format_wechat_references(md_text: str) -> str:
 
     return md_text
 
+def remove_invalid_lines(md_text: str) -> str:
+    """
+    极简过滤：只要该行包含“片段”或“来源文件”，就将整行删除。
+    """
+    # ^.*匹配行首任意内容，(?:片段|来源文件)匹配这两个词其一，.*匹配到行尾，最后带上换行符一起删掉
+    pattern = r'^.*(?:片段|来源文件).*(?:\r?\n|$)'
+    return re.sub(pattern, '', md_text, flags=re.MULTILINE)
+
 def remove_fragments(text: str) -> str:
     """
     删除类似 [片段 1] / [片段 1-3] / [片段 2,3] 的标记
@@ -550,9 +568,9 @@ def remove_fragments(text: str) -> str:
 
 def main():
     # --- 配置项 ---
-    md_dir = "/root/autodl-tmp/evidence_card_online/card_md"
+    md_dir = "/root/autodl-tmp/evidence_card_online/card_md_test"
     test_mode = True  # 设置为 True 则只选取较少数量测试
-    batch_size = 5
+    batch_size = 8
     draft_mode = False # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
     # --------------
 
@@ -619,6 +637,9 @@ def main():
             # content = clean_markdown_for_wechat(content)
             # 删除类似 [片段 1] / [片段 1-3] / [片段 2,3] 的标记
             content = remove_fragments(content)
+
+            # ✅ 新增：简单粗暴地删除任何包含“片段”或“来源文件”的行
+            content = remove_invalid_lines(content)
 
             # 参考文献
             content = format_wechat_references(content)
