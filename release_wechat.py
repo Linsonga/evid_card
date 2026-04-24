@@ -84,7 +84,7 @@ def normalize_references(md_text: str) -> str:
     return body + ref_title + refs
 
 
-def get_seasonal_articles_realtime(candidate_files):
+def get_seasonal_articles_realtime(candidate_files, limit=8):
     """
     使用联网搜索获取实时热点并匹配文件
     """
@@ -99,14 +99,15 @@ def get_seasonal_articles_realtime(candidate_files):
 
     任务步骤：
     1. 请先联网搜索并分析当前时间节点下，中国大部分地区最受关注的医学预防、季节性疾病或健康生活话题（例如：柳絮过敏、某种传染病高发期、换季心血管提醒等）。
-    2. 根据搜索到的实时热点，从下方的文件路径列表中，挑选出最适合在今天发布的文章。
-
+    2. 根据搜索到的实时热点，从下方的文件路径列表中，挑选出最适合在今天发布的文章。请挑选出 {limit} 篇文章（如果符合热点的文章很多，请尽量选满 {limit} 篇）。
+    3. 降级备选策略：如果文件列表中没有任何文章符合当前的实时热点话题，请启动备选方案，从列表中挑选出 {limit} 篇关于“常年热门/高发疾病”（如心脑血管疾病、三高、常见肿瘤、常见儿科疾病等）或“大众普遍关注的常规健康科普”文章。
+    
     待筛选的文件列表（包含相对路径）：
     {json.dumps(candidate_files, ensure_ascii=False)}
 
     输出要求：
     请务必仅返回一个 JSON 数组，包含筛选出的文件路径字符串。
-    如果没有符合热点的文件，请返回空数组 []。
+    如果既没有符合实时热点的文件，也没有符合常年热门疾病的文件，才返回空数组 []。
     不要输出任何搜索过程或其他解释文字。
     """
 
@@ -568,10 +569,10 @@ def remove_fragments(text: str) -> str:
 
 def main():
     # --- 配置项 ---
-    md_dir = "/root/autodl-tmp/evidence_card_online/card_md_test"
+    md_dir = "/root/autodl-tmp/evidence_card_online/card_md"
     test_mode = True  # 设置为 True 则只选取较少数量测试
     batch_size = 8
-    draft_mode = False # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
+    draft_mode = True # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
     # --------------
 
     if not os.path.exists(md_dir):
@@ -601,7 +602,7 @@ def main():
     print(f"共发现 {len(all_md_files)} 个文件，待发布 {len(unpublished_files)} 个。")
 
     # 3. 联网搜索实时热点并筛选
-    seasonal_files = get_seasonal_articles_realtime(unpublished_files)
+    seasonal_files = get_seasonal_articles_realtime(unpublished_files, limit=batch_size)
 
     if not seasonal_files:
         print("未匹配到实时热点文章。")
@@ -625,13 +626,6 @@ def main():
 
             with open(full_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-
-            # content = to_wechat(
-            #     full_path,
-            #     theme='blue',  # 可选主题，如 'rose'(蔷薇紫), 'geek'(极客黑), 'blue'(科技蓝) 等
-            #     code_theme='github',  # 如果你的医学科普里带有代码，这里可以选代码块高亮主题
-            #     mac_style=True  # 苹果风格的 UI 装饰
-            # )
 
             # 调用公共方法
             # content = clean_markdown_for_wechat(content)

@@ -22,6 +22,10 @@ publish_test.py - Description of the file/module
 # @File    : release_zhihu.py
 
 import os
+# 解决 Conda 库与系统 Chrome 动态库冲突的问题
+if 'LD_LIBRARY_PATH' in os.environ:
+    os.environ['LD_LIBRARY_PATH'] = ''
+
 import json
 import re
 from datetime import datetime
@@ -35,6 +39,78 @@ from utils import (
     extract_json_array_from_text
 )
 
+
+
+def format_wechat_references(md_text: str) -> str:
+    if not md_text:
+        return ""
+
+    # 1. 清理特殊空格
+    md_text = md_text.replace('\xa0', ' ')
+
+    # 2. 去掉 --- 分隔符（整行）
+    md_text = re.sub(r'^\s*[-—－]{2,}\s*$', '', md_text, flags=re.MULTILINE)
+
+    # 3. 统一参考文献标题（支持 ### / ** / 普通）
+    # 1处理 ### 参考文献
+    md_text = re.sub(
+        r'^\s*#{1,6}\s*参考文献\s*$',
+        '<br><br>参考文献<br>',
+        md_text,
+        flags=re.MULTILINE
+    )
+
+    # 2 处理 **参考文献**
+    md_text = re.sub(
+        r'^\s*\*\*参考文献\*\*\s*$',
+        '<br><br>参考文献<br>',
+        md_text,
+        flags=re.MULTILINE
+    )
+
+    # 3 兜底（普通“参考文献”）
+    md_text = re.sub(
+        r'^\s*参考文献\s*$',
+        '<br>参考文献<br>',
+        md_text,
+        flags=re.MULTILINE
+    )
+
+    # 4. 拆分正文和参考文献
+    parts = md_text.split('<br>参考文献<br>')
+
+    if len(parts) >= 2:
+        ref_body = parts[-1].strip()
+
+        # 5. 给每个 [n] 前加换行（除了第一个）
+        formatted_ref_body = re.sub(
+            r'(?<!^)\s*(\[|［|【)\s*(\d+)\s*(\]|］|】)',
+            r'<br>[\2] ',
+            ref_body
+        )
+
+        # 6. 清理开头多余 <br>
+        formatted_ref_body = re.sub(r'^<br>', '', formatted_ref_body)
+
+        parts[-1] = formatted_ref_body
+        md_text = '<br>参考文献<br>'.join(parts)
+
+    return md_text
+
+def remove_invalid_lines(md_text: str) -> str:
+    """
+    极简过滤：只要该行包含“片段”或“来源文件”，就将整行删除。
+    """
+    # ^.*匹配行首任意内容，(?:片段|来源文件)匹配这两个词其一，.*匹配到行尾，最后带上换行符一起删掉
+    pattern = r'^.*(?:片段|来源文件).*(?:\r?\n|$)'
+    return re.sub(pattern, '', md_text, flags=re.MULTILINE)
+
+def remove_fragments(text: str) -> str:
+    """
+    删除类似 [片段 1] / [片段 1-3] / [片段 2,3] 的标记
+    """
+    pattern = r'\[片段\s*\d+(?:[-,]\d+)*\]'
+    return re.sub(pattern, '', text)
 
 def get_seasonal_articles_realtime(candidate_files):
     """
@@ -79,6 +155,124 @@ def get_seasonal_articles_realtime(candidate_files):
     return selected_files
 
 
+def process_list_block(block_lines):
+    result = []
+
+    for line in block_lines:
+        indent = len(line) - len(line.lstrip(' '))
+        level = indent // 4
+
+        content = re.sub(r'^\s*\*\s*', '', line).strip()
+
+        # 识别 **标题：**
+        match = re.match(r'\*\*(.*?)\*\*[:：]?\s*(.*)', content)
+
+        if match:
+            title = match.group(1).rstrip('：:')  # ✅ 防止 ：：
+            rest = match.group(2)
+
+            html = f'''
+            <p style="
+                margin-left:{level}em;
+                line-height:1.75em;
+                font-size:15px;
+                color:#333;
+            ">
+                <strong style="color:#d32f2f;">{title}：</strong>{rest}
+            </p>
+            '''.strip()
+
+        else:
+            html = f'''
+            <p style="margin-left:{level}em; line-height:1.75em;">
+                {content}
+            </p>
+            '''.strip()
+
+        result.append(html)
+
+    return result
+
+
+def format_wechat_nested_list(md_text: str) -> str:
+    """
+    只处理嵌套列表块，不破坏正文
+    """
+
+    lines = md_text.split("\n")
+    new_lines = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # 判断是否是列表块开始
+        if re.match(r'^\s*\*\s+', line):
+            block = []
+
+            # 收集连续的 * 列表
+            while i < len(lines) and re.match(r'^\s*\*\s+', lines[i]):
+                block.append(lines[i])
+                i += 1
+
+            # 处理这个 block
+            new_lines.extend(process_list_block(block))
+        else:
+            new_lines.append(line)
+            i += 1
+
+    return "\n".join(new_lines)
+
+
+
+# 修改参考文献序号
+def normalize_references(md_text: str) -> str:
+    # 1. 拆分正文和参考文献
+    parts = re.split(r'(参考文献)', md_text, maxsplit=1)
+    if len(parts) < 3:
+        return md_text  # 没有参考文献标题，直接返回
+
+    body, ref_title, refs = parts
+
+    # 2. 提取参考文献编号
+    ref_items = re.findall(r'\[(\d+)\]', refs)
+
+    # ==========================================
+    # ✅ 新增逻辑：如果文献被删空了，连标题一起隐藏
+    # ==========================================
+    if not ref_items:
+        # 此时说明 refs 里没有任何 [1], [2] 等文献条目
+        # 我们不仅不返回 ref_title 和 refs，还要把 body 末尾的残留符号清理干净
+        # 清理可能前置的 <br>、#、*、横线或多余的换行和空格
+        clean_body = re.sub(r'(?:<br>|#|\*|\s|-|—|－)+$', '', body)
+        return clean_body
+
+    # 3. 构建映射 old -> new
+    unique_nums = []
+    for n in ref_items:
+        if n not in unique_nums:
+            unique_nums.append(n)
+
+    mapping = {old: str(i + 1) for i, old in enumerate(unique_nums)}
+
+    # 4. 删除正文中不存在的引用（如[1]）
+    def clean_invalid(match):
+        num = match.group(1)
+        return f"[{mapping[num]}]" if num in mapping else ""
+
+    body = re.sub(r'\[(\d+)\]', clean_invalid, body)
+
+    # 5. 替换参考文献编号
+    def replace_ref(match):
+        num = match.group(1)
+        return f"[{mapping[num]}]"
+
+    refs = re.sub(r'\[(\d+)\]', replace_ref, refs)
+
+    return body + ref_title + refs
+
+
+
 def main():
     # --- 配置项 ---
     md_dir = "card_md"
@@ -112,16 +306,16 @@ def main():
     print(f"共发现 {len(all_md_files)} 个文件，待发布 {len(unpublished_files)} 个。")
 
     # # 3. 联网搜索实时热点并筛选
-    seasonal_files = get_seasonal_articles_realtime(unpublished_files)
-
-    if not seasonal_files:
-        print("未匹配到实时热点文章。")
-        if test_mode:
-            print("测试模式：强制选取第一个待发布文件进行测试。")
-            seasonal_files = [unpublished_files[0]]
-        else:
-            return
-    # seasonal_files = [unpublished_files[0]]
+    # seasonal_files = get_seasonal_articles_realtime(unpublished_files)
+    #
+    # if not seasonal_files:
+    #     print("未匹配到实时热点文章。")
+    #     if test_mode:
+    #         print("测试模式：强制选取第一个待发布文件进行测试。")
+    #         seasonal_files = [unpublished_files[0]]
+    #     else:
+    #         return
+    seasonal_files = [unpublished_files[0]]
     # 4. 批量/单条发布
     success_count = 0
     for rel_path in seasonal_files:
@@ -132,20 +326,24 @@ def main():
             with open(full_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
 
-            # ========== 新增：处理知乎列表双重序号问题 ==========
-            # 使用正则，将行首的 "1. ", "2. " 替换为 "1、", "2、"
-            # flags=re.MULTILINE 表示让 ^ 匹配每一行的开头
-            # ========== 处理知乎排版 Bug ==========
-            # ========== 1. 处理正文内容 (知乎排版 Bug) ==========
-            # 处理知乎列表双重序号问题 (将 "1. " 替换为 "1、")
-            content = re.sub(r'^(\s*\d+)\.\s+', r'\1、', content, flags=re.MULTILINE)
+            # 调用公共方法
+            # content = clean_markdown_for_wechat(content)
+            # 删除类似 [片段 1] / [片段 1-3] / [片段 2,3] 的标记
+            content = remove_fragments(content)
 
-            # 处理加粗符号导致的多余星号问题 (去除文本中的 **)
-            content = re.sub(r'\*\*(.*?)\*\*', r'\1', content)
+            # ✅ 新增：简单粗暴地删除任何包含“片段”或“来源文件”的行
+            content = remove_invalid_lines(content)
 
-            # 将无序列表的星号 "* " 替换为中文小圆点 "· "，排版更美观
-            content = re.sub(r'^\s*\*\s+', '· ', content, flags=re.MULTILINE)
-            # ====================================================
+            # 参考文献
+            content = format_wechat_references(content)
+
+            # 层级效果
+            # content = format_wechat_nested_list(content)
+
+            content = re.sub(r'^#\s+.*(?:\r?\n|$)', '', content, count=1).strip()
+
+            # 修改参考文献序号
+            content = normalize_references(content)
 
             # 使用文件名（不含路径和后缀）作为标题
             file_name = os.path.basename(rel_path)
@@ -154,7 +352,7 @@ def main():
             print(f"\n正在发布路径为 [{rel_path}] 的文章...")
 
             # 调用知乎发布接口
-            result = create_atticle(title=title, content=content, images=[], topic="医疗科研")
+            result = create_atticle(title=title, content=content, images=[], topic="")
             result_text = result[0].text if result else "无返回结果"
 
             print(f"发布结果: {result_text}")
