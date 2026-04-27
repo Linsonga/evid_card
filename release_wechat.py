@@ -572,7 +572,7 @@ def main():
     md_dir = "/root/autodl-tmp/evidence_card_online/card_md"
     test_mode = True  # 设置为 True 则只选取较少数量测试
     batch_size = 8
-    draft_mode = True # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
+    draft_mode = False # 设置为 True 则只保存草稿，不正式发布（用于预览排版效果）
     # --------------
 
     if not os.path.exists(md_dir):

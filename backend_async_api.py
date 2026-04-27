@@ -19,7 +19,9 @@ import pandas as pd
 import uvicorn
 import requests
 import pdfplumber
-import pymysql
+# 🌟 修改点 1：引入 aiomysql 替换 pymysql
+import aiomysql
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -27,10 +29,10 @@ from pymilvus import MilvusClient
 
 from config import DB_CONFIG, MILVUS_MAIN_URI, MILVUS_MAIN_TOKEN, PORT
 from utils import vector_4b, request_qwen_async
-# 🌟 新增导入：KMeans, numpy 和 JSON提取工具
+# 新增导入：KMeans, numpy 和 JSON提取工具
 import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity  # 🌟 新增相似度计算库
+from sklearn.metrics.pairwise import cosine_similarity  # 新增相似度计算库
 from utils import vector_4b, request_qwen_async, extract_json_array_from_text, get_cached_vector, extract_text_from_image
 from xmindparser import xmind_to_dict
 import glob
@@ -59,6 +61,9 @@ os.makedirs(STATE_DIR, exist_ok=True)  # 🌟 新增创建目录
 # Milvus 客户端
 milvus_client = MilvusClient(uri=MILVUS_MAIN_URI, token=MILVUS_MAIN_TOKEN)
 
+# 🌟 新增：全局数据库连接池
+db_pool = None
+
 # 全局预编译正则
 ZH_PATTERN     = re.compile(r'[\u4e00-\u9fa5]')
 SYMBOL_PATTERN = re.compile(r'[#\|\$_\~\^\/\\<>\*\}]')
@@ -78,10 +83,35 @@ class FileCallbackItem(BaseModel):
 # ================= 启动事件 =================
 @app.on_event("startup")
 async def startup_event():
-    global pdf_parser_engine
-    # print("正在加载 YOLO 和 OCR 模型入显存...")
+    global pdf_parser_engine, db_pool
+
+    # 🌟 修改点 2：初始化 aiomysql 异步连接池
+    try:
+        # 兼容配置字典，将 pymysql 的 'database' 替换为 aiomysql 的 'db' (如果存在)
+        db_config_async = DB_CONFIG.copy()
+        if 'database' in db_config_async:
+            db_config_async['db'] = db_config_async.pop('database')
+
+        db_pool = await aiomysql.create_pool(
+            **db_config_async,
+            minsize=1,
+            maxsize=20,  # 连接池最大连接数，可根据并发量调节
+            autocommit=False  # 手动控制事务
+        )
+        print("✅ 数据库异步连接池初始化成功！")
+    except Exception as e:
+        print(f"❌ 数据库连接池初始化失败: {e}")
+
     pdf_parser_engine = PDFParsing(layout_path=LAYOUT_PATH)
-    print("模型加载完毕，API 准备就绪！")
+    print("✅ 模型加载完毕，API 准备就绪！")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global db_pool
+    if db_pool:
+        db_pool.close()
+        await db_pool.wait_closed()
+        print("🛑 数据库连接池已安全关闭。")
 
 
 # ================= 辅助函数 =================
@@ -133,106 +163,85 @@ async def async_process_and_insert_to_milvus(*args, **kwargs):
     )
 
 
-# ================= 🌟 修改点 2：新增获取历史卡片函数 =================
-def get_user_history_titles(user_id: int) -> list:
-    """从数据库中获取该用户之前生成的所有卡片标题"""
-    conn = None
-    cursor = None
+# ================= 新增获取历史卡片函数，全异步化的数据库操作 =================
+async def get_user_history_titles(user_id: str) -> list:
+    """从数据库中获取该用户之前生成的所有卡片标题 (异步版)"""
+    global db_pool
+    if not db_pool:
+        print("[DB ERROR] 连接池未初始化")
+        return []
+
     try:
-        conn = pymysql.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        cursor.execute("SELECT card_name FROM evidence_file_card_name WHERE user_id = %s", (user_id,))
-        rows = cursor.fetchall()
-        return [row[0] for row in rows] if rows else []
+        async with db_pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT card_name FROM evidence_file_card_name WHERE user_id = %s", (user_id,))
+                rows = await cursor.fetchall()
+                return [row[0] for row in rows] if rows else []
     except Exception as e:
         print(f"[DB ERROR] 获取用户历史卡片失败: {e}")
         return []
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
 
-# ================= 修改mysql状态 =================
-def update_file_parse_status(file_id: int, status: int, fail_reason: str = None):
-    """
-    更新 evidence_file_info 表的解析状态及失败原因
-    status: 1-解析完成；2-解析失败
-    """
+
+# # ================= 修改mysql状态 =================
+async def update_file_parse_status(file_id: int, status: int, fail_reason: str = None):
+    """更新 evidence_file_info 表的解析状态及失败原因 (异步版)"""
+    global db_pool
+    if not db_pool:
+        return
+
     if fail_reason:
         fail_reason = fail_reason[:250]  # 兜底防溢出
 
-    conn = None
-    cursor = None
     try:
-        conn = pymysql.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        # 🌟 修改点：SQL 语句增加 fail_reason 的更新
-        sql = "UPDATE evidence_file_info SET file_status = %s, fail_reason = %s WHERE id = %s"
-        cursor.execute(sql, (status, fail_reason, file_id))
-        conn.commit()
-        print(f"[DB LOG] 文件ID {file_id} 状态更新为 {status}, 失败原因: {fail_reason}")
+        async with db_pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                sql = "UPDATE evidence_file_info SET file_status = %s, fail_reason = %s WHERE id = %s"
+                await cursor.execute(sql, (status, fail_reason, file_id))
+                await conn.commit()
+                print(f"[DB LOG] 文件ID {file_id} 状态更新为 {status}, 失败原因: {fail_reason}")
     except Exception as e:
-        if conn:
-            conn.rollback()
         print(f"[DB ERROR] 更新文件状态失败: {e}")
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+
+
+
 
 
 # ================= 🌟 修改点 2：新增分批存库函数 =================
-def insert_file_card_names(file_id: int, user_id: int, card_names: list):
+# ================= 修改为全异步的分批存库函数 =================
+async def insert_file_card_names(file_id: int, user_id: str, card_names: list):
     """
-    分批将大模型提炼的卡片标题写入 evidence_file_card_name 表
+    分批将大模型提炼的卡片标题写入 evidence_file_card_name 表 (异步版)
     """
-    if not card_names:
+    global db_pool
+    if not card_names or not db_pool:
         return
-    conn = None
-    cursor = None
+
     try:
-        conn = pymysql.connect(**DB_CONFIG)
-        cursor = conn.cursor()
+        async with db_pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                # 生成当前时间戳 (13位毫秒级)
+                current_time = int(time.time() * 1000)
 
-        # 1. 生成当前时间戳
-        # int(time.time()) 生成的是 10 位数的秒级时间戳。
-        # 如果你的 bigint 字段设计用来存储 13 位数的毫秒级时间戳，请改为：int(time.time() * 1000)
-        # current_time = int(time.time())
-        current_time = int(time.time() * 1000)
-
-        sql = """
-            INSERT INTO evidence_file_card_name (file_id, card_name, name_info, user_id, status, name_repeat, status_time)
-            VALUES (%s, %s, %s, %s, 0, %s, %s)
-        """
-        # 修改：元组中增加 item.get("name_repeat", 0)
-        insert_data = [
-            (
-                file_id,
-                item["title"],
-                item["reason"],
-                user_id,
-                item.get("name_repeat", 0),
-                current_time
-            )
-            for item in card_names
-        ]
-
-        # 构造批量插入的数据元组
-        # insert_data = [(file_id, item["title"], item["reason"], user_id) for item in cards]
-        cursor.executemany(sql, insert_data)
-        conn.commit()
-        print(f"[DB LOG] 成功为文件ID {file_id} 插入 {cursor.rowcount} 个新卡片标题！")
+                sql = """
+                    INSERT INTO evidence_file_card_name (file_id, card_name, name_info, user_id, status, name_repeat, status_time)
+                    VALUES (%s, %s, %s, %s, 0, %s, %s)
+                """
+                insert_data = [
+                    (
+                        file_id,
+                        item["title"],
+                        item["reason"],
+                        user_id,
+                        item.get("name_repeat", 0),
+                        current_time
+                    )
+                    for item in card_names
+                ]
+                await cursor.executemany(sql, insert_data)
+                await conn.commit()
+                print(f"[DB LOG] 成功为文件ID {file_id} 插入 {cursor.rowcount} 个新卡片标题！")
     except Exception as e:
-        if conn:
-            conn.rollback()
         print(f"[DB ERROR] 插入卡片标题失败: {e}")
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
 
 
 def is_chinese_or_english(text, threshold=0.05):
@@ -339,17 +348,13 @@ def convert_doc_to_docx_sync(doc_path: str, output_dir: str):
         doc_path,
         "--outdir", output_dir
     ]
-    # 🌟 核心修改：复制当前环境变量并清空 LD_LIBRARY_PATH
-    clean_env = os.environ.copy()
-    clean_env["LD_LIBRARY_PATH"] = ""
-
     try:
-        # 🌟 核心修改：传入 env=clean_env
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=clean_env)
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     except subprocess.CalledProcessError as e:
         raise Exception(f"DOC 转 DOCX 失败: {e.stderr.decode('utf-8', errors='ignore')}")
     except FileNotFoundError:
         raise Exception("找不到 soffice 命令，请确保服务器安装了 LibreOffice")
+
 
 def extract_text_from_pdf_with_plumber(pdf_path: str) -> list:
     """
@@ -494,13 +499,8 @@ def convert_office_to_pdf_sync(docx_path: str, output_dir: str):
         docx_path,
         "--outdir", output_dir
     ]
-    # 🌟 核心修改：复制当前环境变量并清空 LD_LIBRARY_PATH
-    clean_env = os.environ.copy()
-    clean_env["LD_LIBRARY_PATH"] = ""
-
     try:
-        # 🌟 核心修改：传入 env=clean_env
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=clean_env)
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     except subprocess.CalledProcessError as e:
         raise Exception(f"DOCX 转 PDF 失败: {e.stderr.decode('utf-8', errors='ignore')}")
     except FileNotFoundError:
@@ -622,7 +622,7 @@ def process_and_insert_to_milvus(task_id: str, chunked_data: list, batch_id: str
 
 
 # ================= 🌟 修改点 4：新增卡片提炼核心逻辑 =================
-async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list: list, texts: list, metadata: list):
+async def mine_card_titles_for_file(file_id: int, user_id: str, embeddings_list: list, texts: list, metadata: list):
     """基于向量聚类与大模型，智能提炼卡片标题"""
     TARGET_TOTAL_TITLES = 10  # 目标提取总数
     BATCH_INSERT_SIZE = 5  # 每满 5 个插入一次数据库
@@ -647,7 +647,7 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
         })
 
     # 1. 提前拉取该用户在数据库中已有的所有卡片标题
-    existing_db_titles = get_user_history_titles(user_id)
+    existing_db_titles = await get_user_history_titles(user_id)
     history_topics = list(set(existing_db_titles))  # 作为防重名黑名单
 
     # 2. 将历史标题转化为向量，利用 utils 的 get_cached_vector (会自动读本地文件)
@@ -815,7 +815,8 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
 
                 # 每满 5 个插入一次
                 if len(accumulated_for_db) >= BATCH_INSERT_SIZE:
-                    insert_file_card_names(file_id, user_id, accumulated_for_db)
+                    await insert_file_card_names(file_id, user_id, accumulated_for_db)
+                    # insert_file_card_names(file_id, user_id, accumulated_for_db)
                     accumulated_for_db.clear()
 
             # 短暂等待以防止 Qwen 频控限制
@@ -826,7 +827,8 @@ async def mine_card_titles_for_file(file_id: int, user_id: int, embeddings_list:
 
     # 如果最后还有剩余未能满足 5 个的元素，一次性清空插入
     if accumulated_for_db:
-        insert_file_card_names(file_id, user_id, accumulated_for_db)
+        await insert_file_card_names(file_id, user_id, accumulated_for_db)
+        # insert_file_card_names(file_id, user_id, accumulated_for_db)
         accumulated_for_db.clear()
 
 
@@ -1130,7 +1132,8 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
         # --- 判定 Milvus 入库结果 ---
         if isinstance(db_result, dict) and db_result.get("status") == "success":
             # 🌟 全部流程成功：更新数据库状态为 1
-            update_file_parse_status(file_id, 1, None)
+            await update_file_parse_status(file_id, 1, None)
+            # update_file_parse_status(file_id, 1, None)
 
             # 🌟 新增：触发卡片标题提炼
             embeddings = db_result.get("embeddings", [])
@@ -1141,12 +1144,12 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
                 print(f"[批次 {batch_id}] 任务 {task_id} 向量入库完毕，开始智能提炼卡片标题...")
                 # user_id 强转为 int 方便落库
                 # 生成卡片
-                await mine_card_titles_for_file(file_id, int(user_id), embeddings, texts, metadata)
-                print(f"[批次 {batch_id}] 任务 {task_id} 卡片标题提炼全部完成！")
+                await mine_card_titles_for_file(file_id, user_id, embeddings, texts, metadata)
+                print(f"[批次 {batch_id}] s任务 {task_id} 卡片标题提炼全部完成！")
         else:
             # 入库环节显式返回失败：更新状态为 2
             fail_msg = db_result.get("msg", "解析或入库失败") if isinstance(db_result, dict) else "未知错误"
-            update_file_parse_status(file_id, 2, fail_msg)
+            await update_file_parse_status(file_id, 2, fail_msg)
 
 
         # 保存任务完成状态
@@ -1173,7 +1176,7 @@ async def background_process_pdf_batch(task_id: str, batch_id: str, file_path: s
             friendly_error_msg = "文件解析失败"
 
         # 捕获任何阶段的异常（下载后解析失败、分块失败等）：更新状态为 2
-        update_file_parse_status(file_id, 2, friendly_error_msg)
+        await update_file_parse_status(file_id, 2, friendly_error_msg)
 
         error_data = {
             "task_id":   task_id,
@@ -1197,7 +1200,7 @@ class GenerateTitlesRequest(BaseModel):
 
 
 # ================= 🌟 新增：从向量库查询并生成卡片的后台任务 =================
-async def background_generate_titles(file_id: int, user_id: int):
+async def background_generate_titles(file_id: int, user_id: str):
     """
     根据 file_id 查向量库，并调用卡片生成逻辑
     """
@@ -1272,7 +1275,7 @@ async def download_convert_and_process(file_url: str, download_path: str, ext: s
     except Exception as e:
         print(f"❌ [任务 {task_id}] 下载或转换失败: {e}")
         # 失败时更新 MySQL 状态为 2
-        update_file_parse_status(file_id, 2, f"文件下载异常")  # 截取前200字符防超长
+        await update_file_parse_status(file_id, 2, f"文件下载异常")  # 截取前200字符防超长
 
         # 记录失败状态到文件
         error_data = {
@@ -1386,5 +1389,5 @@ async def generate_titles_endpoint(req: GenerateTitlesRequest, background_tasks:
 
 
 if __name__ == "__main__":
-    final_port = int(PORT)
-    uvicorn.run(app, host="0.0.0.0", port=final_port, workers=1)
+    # final_port = int(PORT)
+    uvicorn.run(app, host="0.0.0.0", port=6111, workers=1)
